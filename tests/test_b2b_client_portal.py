@@ -345,6 +345,94 @@ def test_another_clients_consignment_is_not_our_stock():
     assert build_stock(session, client_id=2)["items"] == []
 
 
+def seed_drifted_consignment(session):
+    """A consignment invoice whose Consignment mirror lost its quantities.
+
+    Both records are written at invoice time, and they demonstrably drift in
+    the wild (edits, part-built records, imports). The invoice is the record
+    of what physically went out, so stock must follow it.
+    """
+    client = B2BClient(id=1, name="Yo Studio", payment_terms="consignment",
+                       is_active=True, portal_token=TOKEN, portal_enabled=True)
+    beans = Product(id=1, sku="BNS", name="Coffee beans", price=Decimal("180"), unit="kg")
+    session.add_all([client, beans])
+    session.flush()
+
+    inv = B2BInvoice(id=1, invoice_number="B2B-00001", client_id=1,
+                     invoice_type="consignment", status="consignment",
+                     subtotal=Decimal("900"), total=Decimal("900"),
+                     amount_paid=Decimal("0"),
+                     created_at=datetime(2026, 8, 4, tzinfo=timezone.utc))
+    session.add(inv)
+    session.flush()
+    session.add(B2BInvoiceItem(invoice_id=1, product_id=1, qty=Decimal("5"),
+                               unit_price=Decimal("180"), total=Decimal("900")))
+    cons = Consignment(id=1, ref_number="CONS-0001", client_id=1, invoice_id=1,
+                       status="active",
+                       created_at=datetime(2026, 8, 4, tzinfo=timezone.utc))
+    session.add(cons)
+    session.flush()
+    # The drift: the mirror carries the price but no quantity.
+    session.add(ConsignmentItem(consignment_id=1, product_id=1, qty_sent=Decimal("0"),
+                                qty_sold=Decimal("0"), qty_returned=Decimal("0"),
+                                unit_price=Decimal("180")))
+    session.commit()
+    return client
+
+
+def test_stock_follows_the_invoice_when_the_consignment_mirror_drifted():
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        stock = build_stock(session)
+        received = build_products(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    # 5 on the invoice, nothing sold or returned - NOT the mirror's zero
+    assert beans["qty_sent"] == 5.0
+    assert beans["qty_on_hand"] == 5.0
+    assert beans["unit_price"] == 180.0
+    assert beans["value_on_hand"] == 900.0
+    # ... and the two portal tabs agree, which is the whole point
+    assert received["products"][0]["qty_net"] == beans["qty_on_hand"]
+
+
+def test_reported_sale_against_a_drifted_mirror_still_reduces_stock():
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        add_reported_sale(session, product_id=1, qty=2, unit_price=180)
+        stock = build_stock(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    assert beans["qty_sold"] == 2.0
+    assert beans["qty_on_hand"] == 3.0
+    assert beans["value_on_hand"] == 540.0
+
+
+def test_client_refunds_take_consignment_goods_back_off_the_shelf():
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        refund = B2BRefund(id=1, refund_number="BRF-0001", client_id=1,
+                           subtotal=Decimal("360"), total=Decimal("360"),
+                           created_at=datetime(2026, 8, 9, tzinfo=timezone.utc))
+        session.add(refund)
+        session.flush()
+        session.add(B2BRefundItem(refund_id=1, product_id=1, qty=Decimal("2"),
+                                  unit_price=Decimal("180"), total=Decimal("360")))
+        session.commit()
+        stock = build_stock(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    assert beans["qty_returned"] == 2.0
+    assert beans["qty_on_hand"] == 3.0
+
+
+def test_a_client_with_no_consignments_has_no_stock():
+    with make_session() as session:
+        seed(session)
+        assert build_stock(session, client_id=2)["items"] == []
+        assert build_stock(session, client_id=2)["totals"]["value_on_hand"] == 0.0
+
+
 # ── Portal access control ────────────────────────────────────────────────────
 
 def make_client(session):

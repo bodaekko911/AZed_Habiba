@@ -1992,22 +1992,31 @@ async def _build_client_products_payload(
 
 async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSession) -> dict:
     """
-    What the client is still physically holding on consignment — their own
-    stock of our goods, not yet sold and not yet returned.
+    What the client is still physically holding on consignment - their own
+    stock of our goods, neither sold on nor sent back.
 
-    Per consignment line the goods still on the shelf are
-    ``qty_sent - qty_sold - qty_returned``. Two separate flows retire that
-    quantity and only one of them writes to ``qty_sold``:
+    Where "sent" comes from
+    -----------------------
+    A consignment invoice writes the same lines onto BOTH the invoice and the
+    Consignment mirror, and the two can drift (an item edited on one side, a
+    part-built record, an import). ``_build_client_products_payload`` already
+    resolves that by treating the invoice as authoritative and falling back to
+    the Consignment only when no invoice backs it; this does the same, so
+    "Stock on hand" and "Products received" can never contradict each other on
+    the same page.
 
-      • Settle (B2B -> Consignments) moves qty_sold / qty_returned directly
-      • Record Consignment Payment (Accounting -> B2B Clients) is bookkeeping
-        only, and leaves the quantities alone — what the client reported sold
+    What retires it
+    ---------------
+      * Settle (B2B -> Consignments) writes qty_sold / qty_returned directly
+      * Record Consignment Payment (Accounting -> B2B Clients) is bookkeeping
+        only and leaves those columns alone - what the client reported sold
         lives on the ConsignmentSale lines instead
+      * Client refunds send goods physically back to us
 
-    So both are netted off here, per product, floored at zero. An operator uses
-    one flow or the other; if both were used for the same goods the accounts
-    already double-count them, and this figure follows the records rather than
-    inventing a reconciliation.
+    All three are netted off per product and the result floored at zero. An
+    operator uses the settle flow or the payment flow, not both; if both were
+    used for the same goods the accounts already double-count them, and this
+    figure follows the records rather than inventing a reconciliation.
     """
     cons_result = await db.execute(
         select(Consignment)
@@ -2016,8 +2025,70 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         .order_by(Consignment.created_at)
     )
     consignments = cons_result.scalars().all()
+    if not consignments:
+        return {"items": [], "totals": _empty_consignment_stock_totals()}
 
-    # Quantities the client reported sold on their payments, by product.
+    # Lines of the invoices behind those consignments - the authoritative
+    # record of what actually went out the door.
+    invoice_ids = {c.invoice_id for c in consignments if c.invoice_id}
+    invoice_lines: dict[int, list] = {}
+    if invoice_ids:
+        inv_result = await db.execute(
+            select(B2BInvoice)
+            .where(B2BInvoice.id.in_(invoice_ids))
+            .options(selectinload(B2BInvoice.items).selectinload(B2BInvoiceItem.product))
+        )
+        for inv in inv_result.scalars().all():
+            invoice_lines[inv.id] = list(inv.items)
+
+    products: dict[int, dict] = {}
+
+    def bucket(product, product_id):
+        entry = products.get(product_id)
+        if entry is None:
+            entry = products[product_id] = {
+                "product_id":       product_id,
+                "name":             getattr(product, "name", None) or f"Product #{product_id}",
+                "sku":              getattr(product, "sku", None) or "",
+                "unit":             getattr(product, "unit", None) or "",
+                "qty_sent":         0.0,
+                "qty_settled_sold": 0.0,
+                "qty_returned":     0.0,
+                "_price_qty":       0.0,
+                "_price_value":     0.0,
+                "last_received":    None,
+            }
+        return entry
+
+    def note_sent(entry, qty, price, when):
+        entry["qty_sent"] += qty
+        entry["_price_qty"] += qty
+        entry["_price_value"] += qty * price
+        if when and (entry["last_received"] is None or when > entry["last_received"]):
+            entry["last_received"] = when
+
+    for cons in consignments:
+        lines = invoice_lines.get(cons.invoice_id) if cons.invoice_id else None
+        if lines is not None:
+            for it in lines:
+                note_sent(
+                    bucket(it.product, it.product_id),
+                    float(it.qty or 0), float(it.unit_price or 0), cons.created_at,
+                )
+        for ci in cons.items:
+            price = float(ci.unit_price or 0)
+            entry = bucket(ci.product, ci.product_id)
+            if lines is None:
+                note_sent(entry, float(ci.qty_sent or 0), price, cons.created_at)
+            # qty_sold / qty_returned live only on the consignment, whichever
+            # side supplied the quantity sent.
+            entry["qty_settled_sold"] += float(ci.qty_sold or 0)
+            entry["qty_returned"] += float(ci.qty_returned or 0)
+            # Price for a product the invoice never priced (drifted mirror).
+            if not entry["_price_qty"] and price:
+                entry["_price_qty"], entry["_price_value"] = 1.0, price
+
+    # Quantities the client reported sold on their payments.
     sold_result = await db.execute(
         select(ConsignmentSaleItem)
         .join(ConsignmentSale, ConsignmentSaleItem.sale_id == ConsignmentSale.id)
@@ -2027,57 +2098,40 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
     for line in sold_result.scalars().all():
         reported_sold[line.product_id] = reported_sold.get(line.product_id, 0.0) + float(line.qty or 0)
 
-    products: dict[int, dict] = {}
-    for cons in consignments:
-        for ci in cons.items:
-            sent     = float(ci.qty_sent or 0)
-            sold     = float(ci.qty_sold or 0)
-            returned = float(ci.qty_returned or 0)
-            price    = float(ci.unit_price or 0)
-            entry = products.get(ci.product_id)
-            if entry is None:
-                entry = products[ci.product_id] = {
-                    "product_id":       ci.product_id,
-                    "name":             getattr(ci.product, "name", None) or f"Product #{ci.product_id}",
-                    "sku":              getattr(ci.product, "sku", None) or "",
-                    "unit":             getattr(ci.product, "unit", None) or "",
-                    "qty_sent":         0.0,
-                    "qty_settled_sold": 0.0,
-                    "qty_returned":     0.0,
-                    "_price_qty":       0.0,
-                    "_price_value":     0.0,
-                    "last_received":    None,
-                }
-            entry["qty_sent"]         += sent
-            entry["qty_settled_sold"] += sold
-            entry["qty_returned"]     += returned
-            # Unit price is the qty-weighted average of what was sent, so a
-            # product sent twice at different prices values sensibly.
-            entry["_price_qty"]   += sent
-            entry["_price_value"] += sent * price
-            when = cons.created_at
-            if when and (entry["last_received"] is None or when > entry["last_received"]):
-                entry["last_received"] = when
+    # Goods physically sent back on a client refund. Only products actually
+    # placed on consignment count, so a refund against an outright sale cannot
+    # eat into consignment stock.
+    refund_result = await db.execute(
+        select(B2BRefundItem)
+        .join(B2BRefund, B2BRefundItem.refund_id == B2BRefund.id)
+        .where(B2BRefund.client_id == client_id)
+    )
+    refunded: dict[int, float] = {}
+    for line in refund_result.scalars().all():
+        if line.product_id in products:
+            refunded[line.product_id] = refunded.get(line.product_id, 0.0) + float(line.qty or 0)
 
     rows = []
     for entry in products.values():
         pid = entry["product_id"]
         qty_reported = round(reported_sold.get(pid, 0.0), 3)
-        on_hand = entry["qty_sent"] - entry["qty_settled_sold"] - entry["qty_returned"] - qty_reported
+        qty_refunded = round(refunded.get(pid, 0.0), 3)
+        on_hand = (entry["qty_sent"] - entry["qty_settled_sold"] - entry["qty_returned"]
+                   - qty_reported - qty_refunded)
         on_hand = max(0.0, round(on_hand, 3))
         unit_price = round(entry["_price_value"] / entry["_price_qty"], 2) if entry["_price_qty"] else 0.0
         rows.append({
-            "product_id":       pid,
-            "name":             entry["name"],
-            "sku":              entry["sku"],
-            "unit":             entry["unit"],
-            "qty_sent":         round(entry["qty_sent"], 3),
-            "qty_sold":         round(entry["qty_settled_sold"] + qty_reported, 3),
-            "qty_returned":     round(entry["qty_returned"], 3),
-            "qty_on_hand":      on_hand,
-            "unit_price":       unit_price,
-            "value_on_hand":    round(on_hand * unit_price, 2),
-            "last_received":    entry["last_received"].strftime("%d-%b-%Y") if entry["last_received"] else "—",
+            "product_id":    pid,
+            "name":          entry["name"],
+            "sku":           entry["sku"],
+            "unit":          entry["unit"],
+            "qty_sent":      round(entry["qty_sent"], 3),
+            "qty_sold":      round(entry["qty_settled_sold"] + qty_reported, 3),
+            "qty_returned":  round(entry["qty_returned"] + qty_refunded, 3),
+            "qty_on_hand":   on_hand,
+            "unit_price":    unit_price,
+            "value_on_hand": round(on_hand * unit_price, 2),
+            "last_received": entry["last_received"].strftime("%d-%b-%Y") if entry["last_received"] else "—",
         })
     rows.sort(key=lambda r: (-r["value_on_hand"], r["name"].lower()))
 
@@ -2092,6 +2146,13 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
             "qty_sold":      round(sum(r["qty_sold"] for r in rows), 3),
             "qty_returned":  round(sum(r["qty_returned"] for r in rows), 3),
         },
+    }
+
+
+def _empty_consignment_stock_totals() -> dict:
+    return {
+        "product_lines": 0, "qty_on_hand": 0.0, "value_on_hand": 0.0,
+        "qty_sent": 0.0, "qty_sold": 0.0, "qty_returned": 0.0,
     }
 
 
