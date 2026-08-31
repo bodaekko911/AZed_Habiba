@@ -779,8 +779,13 @@ async def _record_consignment_client_payment(
     sold_items: Optional[List["ConsignmentSaleItemIn"]] = None,
 ):
     # When sold items are supplied, the amount is the reconciled total of the
-    # items the client reported sold — it must equal the sum of the line totals.
+    # items the client reported sold, net of the client's agreed discount — the
+    # consignment invoice it pays down is booked net of that same discount, so
+    # collecting the gross line total would over-pay the invoice.
+    discount_pct = max(0.0, min(100.0, float(client.discount_pct or 0)))
     sale_lines: list[dict] = []
+    items_subtotal = 0.0
+    items_discount = 0.0
     if sold_items:
         for line in sold_items:
             qty        = round(float(line.qty), 3)
@@ -795,12 +800,20 @@ async def _record_consignment_client_payment(
             })
         if not sale_lines:
             raise HTTPException(status_code=400, detail="No valid sold items were provided")
-        items_total = round(sum(l["total"] for l in sale_lines), 2)
+        items_subtotal = round(sum(l["total"] for l in sale_lines), 2)
+        items_discount = round(items_subtotal * (discount_pct / 100), 2)
+        items_total    = round(items_subtotal - items_discount, 2)
         if abs(items_total - round(amount, 2)) > 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Amount ({amount:.2f}) does not match the sold items total ({items_total:.2f})",
-            )
+            detail = f"Amount ({amount:.2f}) does not match the sold items total ({items_total:.2f})"
+            if items_discount > 0:
+                detail += (
+                    f" — {items_subtotal:.2f} less {discount_pct:g}% client discount"
+                    f" ({items_discount:.2f})"
+                )
+            raise HTTPException(status_code=400, detail=detail)
+        # Within tolerance the server's own net figure wins, so the stored
+        # subtotal - discount always reconciles exactly to what was collected.
+        amount = items_total
 
     open_result = await db.execute(
         select(B2BInvoice)
@@ -889,6 +902,8 @@ async def _record_consignment_client_payment(
             user_id=current_user.id,
             journal_id=journal.id,
             month_label=month_label or None,
+            subtotal=Decimal(str(items_subtotal)),
+            discount=Decimal(str(items_discount)),
             amount=Decimal(str(round(amount, 2))),
         )
         db.add(sale)
@@ -907,7 +922,9 @@ async def _record_consignment_client_payment(
         db,
         "Accounting",
         "collect_consignment_client_payment",
-        f"Consignment client payment - {client.name} - amount: {amount:.2f}" + (f" - {month_label}" if month_label else ""),
+        f"Consignment client payment - {client.name} - amount: {amount:.2f}"
+        + (f" (sold {items_subtotal:.2f} less {discount_pct:g}% discount {items_discount:.2f})" if items_discount > 0 else "")
+        + (f" - {month_label}" if month_label else ""),
         user=current_user,
         ref_type="b2b_client",
         ref_id=client.id,
@@ -917,6 +934,9 @@ async def _record_consignment_client_payment(
         "client_id": client.id,
         "client": client.name,
         "client_outstanding": round(float(client.outstanding), 2),
+        "subtotal": items_subtotal,
+        "discount": items_discount,
+        "discount_pct": discount_pct,
         "amount": round(amount, 2),
         "allocations": allocations,
         "journal_id": journal.id,
@@ -990,7 +1010,17 @@ async def get_client_consignment_items(client_id: int, db: AsyncSession = Depend
     on consignment, with their consignment unit prices. Used to populate the
     sold-items picker on the Record Consignment Payment screen. Aggregated
     across the client's non-closed consignments and grouped by product + price.
+
+    Unit prices are gross (as sent); the client's discount is returned
+    alongside them under ``discount_pct`` and is applied to the reported sold
+    total, matching how the consignment invoice itself was booked.
     """
+    client_result = await db.execute(select(B2BClient).where(B2BClient.id == client_id))
+    client = client_result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    discount_pct = max(0.0, min(100.0, float(client.discount_pct or 0)))
+
     result = await db.execute(
         select(ConsignmentItem)
         .join(Consignment, ConsignmentItem.consignment_id == Consignment.id)
@@ -1022,7 +1052,7 @@ async def get_client_consignment_items(client_id: int, db: AsyncSession = Depend
     for r in out:
         r["qty_sent"] = round(r["qty_sent"], 3)
         r["qty_remaining"] = round(r["qty_remaining"], 3)
-    return out
+    return {"discount_pct": discount_pct, "items": out}
 
 
 @router.get("/api/b2b-clients/{client_id}/consignment-sales")
@@ -1040,6 +1070,8 @@ async def get_client_consignment_sales(client_id: int, db: AsyncSession = Depend
         {
             "id": s.id,
             "month_label": s.month_label,
+            "subtotal": round(float(s.subtotal or 0), 2),
+            "discount": round(float(s.discount or 0), 2),
             "amount": round(float(s.amount or 0), 2),
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "items": [
@@ -1538,7 +1570,7 @@ td.cr { font-family:var(--mono); color:var(--blue); }
         <div class="modal-title">💰 Record Consignment Payment</div>
         <div class="modal-sub" id="cons-modal-sub" style="color:var(--muted);font-size:13px;margin-bottom:14px"></div>
         <div style="background:rgba(45,212,191,.06);border:1px solid rgba(45,212,191,.15);border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:var(--teal)">
-            Record the items this client reported sold for the month. The amount is the total of those items and is matched to them automatically.
+            Record the items this client reported sold for the month. The amount is the total of those items less the client's agreed discount, and is matched to them automatically.
         </div>
         <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
             <label style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">For which month's sales? *</label>
@@ -1562,9 +1594,19 @@ td.cr { font-family:var(--mono); color:var(--blue); }
                 <tbody id="cons-items-body"></tbody>
             </table>
         </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;background:var(--card2);border:1px solid var(--border2);border-radius:10px;padding:12px 16px;margin-bottom:16px">
-            <div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Amount Paid (matched to items)</div>
-            <div id="cons-amount-display" class="mono" style="font-size:22px;font-weight:900;color:var(--teal)">0.00 EGP</div>
+        <div style="background:var(--card2);border:1px solid var(--border2);border-radius:10px;padding:12px 16px;margin-bottom:16px">
+            <div style="display:flex;align-items:center;justify-content:space-between;font-size:13px;padding:2px 0">
+                <span style="color:var(--muted)">Items sold subtotal</span>
+                <span class="mono" id="cons-subtotal-display" style="color:var(--text)">0.00</span>
+            </div>
+            <div id="cons-discount-row" style="display:none;align-items:center;justify-content:space-between;font-size:13px;padding:2px 0">
+                <span style="color:var(--muted)">Client discount (<span id="cons-discount-pct">0</span>%)</span>
+                <span class="mono" id="cons-discount-display" style="color:var(--danger)">-0.00</span>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--border2);margin-top:8px;padding-top:10px">
+                <div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">Amount Paid (after discount)</div>
+                <div id="cons-amount-display" class="mono" style="font-size:22px;font-weight:900;color:var(--teal)">0.00 EGP</div>
+            </div>
             <input id="cons-amount" type="hidden" value="0">
         </div>
         <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
@@ -2357,6 +2399,7 @@ let collectInvoiceId = null;
 let consClientId     = null;
 let consClientName   = null;
 let consItems        = [];
+let consDiscountPct  = 0;
 let currentInvDetail = null;
 let refundInvoiceId  = null;
 let refundInvoiceNum = null;
@@ -2454,7 +2497,7 @@ function renderB2BClients(clients){
                         ? `<button style="background:transparent;border:1px solid var(--border2);color:var(--sub);font-size:12px;font-weight:600;padding:5px 10px;border-radius:7px;cursor:pointer;font-family:var(--sans);"
                             onmouseenter="this.style.borderColor='var(--teal)';this.style.color='var(--teal)'"
                             onmouseleave="this.style.borderColor='var(--border2)';this.style.color='var(--sub)'"
-                            onclick="openConsModal(${client.id},'${client.name.replace(/'/g,"\\'")}',${client.outstanding})">💰 Record Payment</button>`
+                            onclick="openConsModal(${client.id},'${client.name.replace(/'/g,"\\'")}',${client.outstanding},${client.discount_pct||0})">💰 Record Payment</button>`
                         : ""}
                     ${client.outstanding > 0.01
                         ? `<button style="background:transparent;border:1px solid var(--border2);color:var(--sub);font-size:12px;font-weight:600;padding:5px 10px;border-radius:7px;cursor:pointer;font-family:var(--sans);"
@@ -2683,13 +2726,16 @@ async function saveCollect(){
 }
 
 /* ── CONSIGNMENT PAYMENT ── */
-async function openConsModal(clientId, clientName, outstanding){
+async function openConsModal(clientId, clientName, outstanding, discountPct){
     consClientId = clientId;
     consClientName = clientName;
     consItems = [];
+    consDiscountPct = Number(discountPct) || 0;
     document.getElementById("cons-modal-sub").innerText = `${clientName} — Client outstanding balance: ${outstanding.toFixed(2)} EGP`;
     document.getElementById("cons-amount").value = "0";
     document.getElementById("cons-amount-display").innerText = "0.00 EGP";
+    document.getElementById("cons-subtotal-display").innerText = "0.00";
+    document.getElementById("cons-discount-display").innerText = "-0.00";
     // Fill month selector
     let sel = document.getElementById("cons-month");
     sel.innerHTML = '<option value="">General payment (no specific month)</option>';
@@ -2705,8 +2751,12 @@ async function openConsModal(clientId, clientName, outstanding){
     document.getElementById("cons-modal").classList.add("open");
     try {
         let res = await fetch(`/accounting/api/b2b-clients/${clientId}/consignment-items`);
-        consItems = await res.json();
-        if(!res.ok){ throw new Error((consItems && consItems.detail) || "Unable to load items"); }
+        let data = await res.json();
+        if(!res.ok){ throw new Error((data && data.detail) || "Unable to load items"); }
+        consItems = Array.isArray(data) ? data : (data.items || []);
+        // The server is the authority on the client's discount; the caller's
+        // value is only a hint from the already-rendered client row.
+        if(data && data.discount_pct !== undefined) consDiscountPct = Number(data.discount_pct) || 0;
     } catch(e){
         consItems = [];
         body.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--danger);padding:24px">${e.message}</td></tr>`;
@@ -2740,7 +2790,7 @@ function renderConsItemRows(){
 }
 
 function recalcConsTotal(){
-    let total = 0;
+    let subtotal = 0;
     document.querySelectorAll("#cons-items-body input[data-idx]").forEach(inp => {
         let idx = parseInt(inp.dataset.idx);
         let qty = parseFloat(inp.value) || 0;
@@ -2748,9 +2798,18 @@ function recalcConsTotal(){
         let line = qty * (consItems[idx] ? consItems[idx].unit_price : 0);
         let cell = document.querySelector(`.cons-line-total[data-idx="${idx}"]`);
         if(cell){ cell.innerText = line.toFixed(2); }
-        total += line;
+        subtotal += line;
     });
-    total = Math.round(total * 100) / 100;
+    // Item prices are gross; the client's discount comes off the total, the
+    // same way it does on the consignment invoice this payment pays down.
+    let pct      = Math.min(100, Math.max(0, consDiscountPct || 0));
+    subtotal     = Math.round(subtotal * 100) / 100;
+    let discount = Math.round(subtotal * pct) / 100;
+    let total    = Math.round((subtotal - discount) * 100) / 100;
+    document.getElementById("cons-subtotal-display").innerText = subtotal.toFixed(2);
+    document.getElementById("cons-discount-pct").innerText     = String(Math.round(pct * 100) / 100);
+    document.getElementById("cons-discount-display").innerText = `-${discount.toFixed(2)}`;
+    document.getElementById("cons-discount-row").style.display = pct > 0 ? "flex" : "none";
     document.getElementById("cons-amount").value = total;
     document.getElementById("cons-amount-display").innerText = `${total.toFixed(2)} EGP`;
 }
@@ -2917,7 +2976,12 @@ async function loadConsPaymentHistory(){
                         <div style="font-weight:700;color:var(--text)">${client.name}
                             ${s.month_label?`<span style="font-size:11px;color:var(--teal);font-weight:700;margin-left:8px">${s.month_label}</span>`:``}
                         </div>
-                        <div class="mono" style="font-weight:900;color:var(--teal)">${s.amount.toFixed(2)} EGP</div>
+                        <div style="text-align:right">
+                            <div class="mono" style="font-weight:900;color:var(--teal)">${s.amount.toFixed(2)} EGP</div>
+                            ${(s.discount||0) > 0
+                                ? `<div class="mono" style="font-size:10px;color:var(--muted)">${(s.subtotal||0).toFixed(2)} sold - ${s.discount.toFixed(2)} discount</div>`
+                                : ``}
+                        </div>
                     </div>
                     <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${when}</div>
                     <div>${itemsHtml || '<span style="color:var(--muted);font-size:11px">No item detail</span>'}</div>

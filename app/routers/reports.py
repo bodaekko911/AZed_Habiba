@@ -463,6 +463,7 @@ async def _load_b2b_client_payment_records(
         journal.id for journal in journals if journal.ref_type == "consignment_client_payment"
     }
     sale_items_by_journal: dict[int, list[dict[str, Any]]] = {}
+    sale_subtotal_by_journal: dict[int, float] = {}
     if consignment_payment_journal_ids:
         sale_result = await db.execute(
             select(ConsignmentSale)
@@ -479,6 +480,13 @@ async def _load_b2b_client_payment_records(
                     "total": _num(it.total),
                 }
                 for it in sale.items
+            )
+            # Line items are held at their gross consignment price; the client
+            # discount comes off the payment. Keep the gross subtotal so the
+            # sold-item detail can be scaled down to the cash actually taken.
+            sale_subtotal_by_journal[sale.journal_id] = (
+                sale_subtotal_by_journal.get(sale.journal_id, 0.0)
+                + (_num(sale.subtotal) or sum(_num(it.total) for it in sale.items))
             )
 
     payment_records = []
@@ -530,6 +538,7 @@ async def _load_b2b_client_payment_records(
             "status": "posted",
             "journal_ref_type": journal.ref_type or "—",
             "sale_items": sale_items_by_journal.get(journal.id, []),
+            "sale_subtotal": round(sale_subtotal_by_journal.get(journal.id, 0.0), 2),
         })
     return payment_records
 
@@ -794,12 +803,19 @@ async def _build_sales_report(
         # rather than via the proportional invoice-item allocation below.
         sale_items = payment.get("sale_items") or []
         if sale_items:
+            # Money is scaled to what was collected — the client discount sits
+            # between the gross line totals and the payment — while quantities
+            # stay exactly as the client reported them sold.
+            sale_subtotal = _num(payment.get("sale_subtotal"))
+            net_ratio = (amount / sale_subtotal) if sale_subtotal > 0 else 1.0
             for line in sale_items:
+                line_total = _num(line.get("total")) * net_ratio
+                unit_price = _num(line.get("unit_price")) * net_ratio
                 add_product(
                     getattr(line.get("product"), "id", None),
                     line.get("product_name") or "-",
                     line.get("qty"),
-                    line.get("total"),
+                    line_total,
                     1,
                 )
                 add_sold_item_record(
@@ -811,8 +827,8 @@ async def _build_sales_report(
                     product=line.get("product"),
                     product_name=line.get("product_name"),
                     qty=line.get("qty"),
-                    unit_price=line.get("unit_price"),
-                    line_total=line.get("total"),
+                    unit_price=unit_price,
+                    line_total=line_total,
                     payment_method=payment.get("payment_method") or "-",
                     status=payment.get("status") or "-",
                 )

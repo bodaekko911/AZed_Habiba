@@ -113,8 +113,10 @@ class ConsignmentItem(Base):
 class ConsignmentSale(Base):
     """
     A recorded consignment-client payment together with the items the client
-    reported sold for a given month. The payment amount equals the sum of the
-    line items (qty × unit_price). This is a bookkeeping record only — it does
+    reported sold for a given month. ``subtotal`` is the gross sum of the line
+    items (qty × unit_price), ``discount`` is the client's agreed discount on
+    that subtotal, and ``amount`` — what the client actually pays — is the two
+    netted off. This is a bookkeeping record only — it does
     NOT modify consignment quantities or stock (that stays with the separate
     Settle flow). It exists so each payment can be reconciled against the
     specific items sold and the month they were sold in.
@@ -126,7 +128,9 @@ class ConsignmentSale(Base):
     user_id     = Column(Integer, ForeignKey("users.id"), nullable=True)
     journal_id  = Column(Integer, ForeignKey("journals.id"), nullable=True)
     month_label = Column(String(100))                 # e.g. "July 2026"
-    amount      = Column(Numeric(14, 2), default=0)    # = sum of item totals
+    subtotal    = Column(Numeric(14, 2), default=0)    # = sum of item totals (gross)
+    discount    = Column(Numeric(14, 2), default=0)    # client discount on the subtotal
+    amount      = Column(Numeric(14, 2), default=0)    # = subtotal - discount (collected)
     notes       = Column(Text)
     created_at  = Column(DateTime(timezone=True), server_default=func.now())
 

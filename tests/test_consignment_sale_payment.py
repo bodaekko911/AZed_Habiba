@@ -80,11 +80,14 @@ def make_session():
     return Session()
 
 
-def _seed(session):
+def _seed(session, discount_pct=0):
     for cid, code, name in [(1, "1000", "Cash"), (2, "1100", "AR"), (3, "2200", "Deferred"), (4, "4000", "Revenue")]:
         session.add(Account(id=cid, code=code, name=name, type="asset", balance=0))
     user = User(id=1, name="Op", role="admin", email="op@x.com", password="x")
-    client = B2BClient(id=1, name="Cons Client", payment_terms="consignment", outstanding=Decimal("500.00"))
+    client = B2BClient(
+        id=1, name="Cons Client", payment_terms="consignment",
+        outstanding=Decimal("500.00"), discount_pct=Decimal(str(discount_pct)),
+    )
     product = Product(id=1, sku="SKU-1", name="Dates", price=Decimal("100.00"), unit="kg", stock=100)
     invoice = B2BInvoice(
         id=1, client_id=1, invoice_number="HB2B-C-1", invoice_type="consignment",
@@ -156,3 +159,71 @@ def test_no_items_behaves_as_amount_only_payment():
         assert payload["sale_id"] is None
         assert session.execute(select(ConsignmentSale)).first() is None
         assert round(float(client.outstanding), 2) == 300.0
+
+
+def test_discount_is_applied_to_the_sold_items_total():
+    # The consignment invoice was booked net of the client's discount, so the
+    # payment must collect the sold items net of that same discount.
+    with make_session() as session:
+        user, client = _seed(session, discount_pct=10)
+        db = AsyncSessionAdapter(session)
+        items = [ConsignmentSaleItemIn(product_id=1, qty=3, unit_price=100.0)]  # 300.00 gross
+
+        payload = run(_record_consignment_client_payment(
+            db, client=client, amount=270.0, month_label="July 2026",
+            current_user=user, sold_items=items,
+        ))
+        session.commit()
+
+        assert payload["subtotal"] == 300.0
+        assert payload["discount"] == 30.0
+        assert payload["discount_pct"] == 10.0
+        assert payload["amount"] == 270.0
+        # only the net amount comes off the balances
+        assert round(float(client.outstanding), 2) == 230.0
+        inv = session.execute(select(B2BInvoice).where(B2BInvoice.id == 1)).scalar_one()
+        assert round(float(inv.amount_paid), 2) == 270.0
+        # the sale record keeps gross, discount and net
+        sale = session.execute(select(ConsignmentSale)).scalar_one()
+        assert round(float(sale.subtotal), 2) == 300.0
+        assert round(float(sale.discount), 2) == 30.0
+        assert round(float(sale.amount), 2) == 270.0
+        # line items stay at their gross consignment price
+        line = session.execute(select(ConsignmentSaleItem)).scalar_one()
+        assert round(float(line.total), 2) == 300.0
+
+
+def test_gross_amount_is_rejected_for_a_discounted_client():
+    with make_session() as session:
+        user, client = _seed(session, discount_pct=10)
+        db = AsyncSessionAdapter(session)
+        items = [ConsignmentSaleItemIn(product_id=1, qty=3, unit_price=100.0)]
+
+        with pytest.raises(HTTPException) as excinfo:
+            run(_record_consignment_client_payment(
+                db, client=client, amount=300.0, month_label="July 2026",
+                current_user=user, sold_items=items,
+            ))
+        assert excinfo.value.status_code == 400
+        assert "270.00" in excinfo.value.detail
+        assert "10% client discount" in excinfo.value.detail
+        assert session.execute(select(ConsignmentSale)).first() is None
+
+
+def test_zero_discount_client_pays_the_gross_items_total():
+    with make_session() as session:
+        user, client = _seed(session)
+        db = AsyncSessionAdapter(session)
+        items = [ConsignmentSaleItemIn(product_id=1, qty=2, unit_price=100.0)]
+
+        payload = run(_record_consignment_client_payment(
+            db, client=client, amount=200.0, month_label=None,
+            current_user=user, sold_items=items,
+        ))
+        session.commit()
+
+        assert payload["discount"] == 0.0
+        assert payload["amount"] == 200.0
+        sale = session.execute(select(ConsignmentSale)).scalar_one()
+        assert round(float(sale.subtotal), 2) == 200.0
+        assert round(float(sale.discount), 2) == 0.0

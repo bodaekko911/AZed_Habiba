@@ -178,7 +178,8 @@ async def ensure_consignment_sales_tables() -> None:
     """Self-healing guard for consignment sale records (sold items captured
     with each consignment payment). Mirrors migration 20260724_0043 so the
     tables exist even if alembic is blocked (e.g. by a multi-head conflict).
-    Idempotent — CREATE ... IF NOT EXISTS is safe on every startup."""
+    Also mirrors 20260831_0046 (subtotal / discount on each payment).
+    Idempotent — CREATE / ALTER ... IF NOT EXISTS is safe on every startup."""
     from app.db.session import AsyncSessionLocal
 
     statements = [
@@ -189,11 +190,18 @@ async def ensure_consignment_sales_tables() -> None:
             user_id INTEGER REFERENCES users(id),
             journal_id INTEGER REFERENCES journals(id),
             month_label VARCHAR(100),
+            subtotal NUMERIC(14, 2) DEFAULT 0,
+            discount NUMERIC(14, 2) DEFAULT 0,
             amount NUMERIC(14, 2) DEFAULT 0,
             notes TEXT,
             created_at TIMESTAMPTZ DEFAULT now()
         )
         """,
+        # Mirrors migration 20260831_0046 for databases created before the
+        # client discount was applied to consignment payments.
+        "ALTER TABLE consignment_sales ADD COLUMN IF NOT EXISTS subtotal NUMERIC(14, 2) DEFAULT 0",
+        "ALTER TABLE consignment_sales ADD COLUMN IF NOT EXISTS discount NUMERIC(14, 2) DEFAULT 0",
+        "UPDATE consignment_sales SET subtotal = COALESCE(amount, 0) WHERE subtotal IS NULL OR subtotal = 0",
         """
         CREATE TABLE IF NOT EXISTS consignment_sale_items (
             id SERIAL PRIMARY KEY,
