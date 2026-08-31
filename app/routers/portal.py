@@ -71,12 +71,14 @@ async def _portal_payload(db: AsyncSession, client: B2BClient) -> dict:
     # Imported here rather than at module scope: app.routers.b2b pulls in the
     # permission stack, and this router must stay importable without it.
     from app.routers.b2b import (
+        _build_client_consignment_stock_payload,
         _build_client_products_payload,
         _build_client_statement_payload,
     )
 
     statement = await _build_client_statement_payload(client.id, db)
     products = await _build_client_products_payload(client.id, db)
+    stock = await _build_client_consignment_stock_payload(client.id, db)
     return {
         "client": {
             "name":           statement["client"]["name"],
@@ -110,6 +112,10 @@ async def _portal_payload(db: AsyncSession, client: B2BClient) -> dict:
         "products":         products["products"],
         "deliveries":       products["deliveries"],
         "product_totals":   products["totals"],
+        # Goods the client still holds on consignment — their own stock of our
+        # products. Empty for clients who never took anything on consignment.
+        "stock":            [r for r in stock["items"] if r["qty_on_hand"] > 0],
+        "stock_totals":     stock["totals"],
     }
 
 
@@ -262,11 +268,13 @@ footer.foot{text-align:center;font-size:11.5px;color:var(--muted);line-height:1.
   <div class="tabs">
     <button class="tab active" data-panel="statement" type="button">Statement</button>
     <button class="tab" data-panel="products" type="button">Products received</button>
+    <button class="tab" data-panel="stock" type="button" id="tab-stock" style="display:none">Stock on hand</button>
     <button class="tab" data-panel="deliveries" type="button">Delivery log</button>
   </div>
 
   <div class="panel active" id="panel-statement"></div>
   <div class="panel" id="panel-products"></div>
+  <div class="panel" id="panel-stock"></div>
   <div class="panel" id="panel-deliveries"></div>
 
   <div class="actions">
@@ -298,6 +306,8 @@ function statusTag(status){
 
 function renderCards(d){
   const due = Number(d.balance_due || 0);
+  const st = d.stock_totals || {};
+  const hasStock = (d.stock || []).length > 0;
   document.getElementById("cards").innerHTML = `
     <div class="card">
       <div class="card-label">Balance due</div>
@@ -319,7 +329,12 @@ function renderCards(d){
       <div class="card-value v-blue">${money(d.product_totals.value_net)}</div>
       <div class="card-note">${d.product_totals.product_lines} product${d.product_totals.product_lines === 1 ? "" : "s"}
         &middot; ${d.product_totals.deliveries} deliver${d.product_totals.deliveries === 1 ? "y" : "ies"}</div>
-    </div>`;
+    </div>` + (hasStock ? `
+    <div class="card">
+      <div class="card-label">Stock on hand</div>
+      <div class="card-value v-amber">${money(st.value_on_hand)}</div>
+      <div class="card-note">${qty(st.qty_on_hand)} across ${st.product_lines} product${st.product_lines === 1 ? "" : "s"}</div>
+    </div>` : "");
 }
 
 function renderStatement(d){
@@ -397,6 +412,62 @@ function renderProducts(d){
     </div>`;
 }
 
+function renderStock(d){
+  // Consignment goods only, so the tab stays hidden for clients who buy outright.
+  const items = d.stock || [];
+  const st = d.stock_totals || {};
+  const tab = document.getElementById("tab-stock");
+  tab.style.display = items.length ? "" : "none";
+  if(!items.length){
+    document.getElementById("panel-stock").innerHTML = "";
+    return;
+  }
+  const rows = items.map(p => `
+    <tr>
+      <td class="name">${esc(p.name)}${p.sku ? ` <span style="color:var(--muted);font-weight:400;font-size:11px">${esc(p.sku)}</span>` : ""}</td>
+      <td class="num" style="color:var(--text);font-weight:700">${qty(p.qty_on_hand)}</td>
+      <td>${esc(p.unit || "—")}</td>
+      <td class="num">${money(p.unit_price)}</td>
+      <td class="num" style="color:var(--text);font-weight:700">${money(p.value_on_hand)}</td>
+      <td class="num">${qty(p.qty_sent)}</td>
+      <td class="num">${p.qty_sold ? qty(p.qty_sold) : "—"}</td>
+      <td class="num">${p.qty_returned ? qty(p.qty_returned) : "—"}</td>
+      <td class="num" style="text-align:left">${esc(p.last_received)}</td>
+    </tr>`).join("");
+
+  document.getElementById("panel-stock").innerHTML = `
+    <div class="block">
+      <div class="block-title">
+        <span>Goods you still hold on consignment</span>
+        <span>Sold and returned already deducted &middot; amounts in EGP</span>
+      </div>
+      <div class="scroll"><table>
+        <thead><tr><th>Product</th><th class="num">On hand</th><th>Unit</th>
+          <th class="num">Unit price</th><th class="num">Value</th>
+          <th class="num">Sent</th><th class="num">Sold</th><th class="num">Returned</th>
+          <th>Last delivery</th></tr></thead>
+        <tbody>${rows}</tbody>
+        <tfoot><tr>
+          <td class="name">Total</td>
+          <td class="num" style="color:var(--text);font-weight:700">${qty(st.qty_on_hand)}</td>
+          <td></td><td class="num"></td>
+          <td class="num" style="color:var(--text);font-weight:700">${money(st.value_on_hand)}</td>
+          <td class="num">${qty(st.qty_sent)}</td>
+          <td class="num">${qty(st.qty_sold)}</td>
+          <td class="num">${qty(st.qty_returned)}</td>
+          <td></td>
+        </tr></tfoot>
+      </table></div>
+    </div>
+    <div class="block">
+      <div class="block-title"><span>You are billed for what you sell, not for what you hold</span></div>
+      <div class="empty" style="text-align:left;color:var(--sub)">
+        These goods are with you on consignment. Anything still on hand can be sold or
+        returned — tell us the quantities you sold and we will record the payment against them.
+      </div>
+    </div>`;
+}
+
 function renderDeliveries(d){
   const body = d.deliveries.length ? d.deliveries.map(x => `
     <div class="delivery">
@@ -444,6 +515,7 @@ async function load(){
     renderCards(d);
     renderStatement(d);
     renderProducts(d);
+    renderStock(d);
     renderDeliveries(d);
   } catch(e){
     document.getElementById("error").style.display = "block";

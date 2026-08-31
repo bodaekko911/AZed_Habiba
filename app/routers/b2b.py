@@ -15,7 +15,10 @@ from app.core.log import record
 from app.core.navigation import render_app_header
 from app.core.product_types import is_stock_tracked_product, normalize_item_type
 from app.core.templates import templates
-from app.models.b2b import B2BClient, B2BInvoice, B2BInvoiceItem, Consignment, ConsignmentItem, B2BRefund, B2BRefundItem, B2BClientPrice
+from app.models.b2b import (
+    B2BClient, B2BInvoice, B2BInvoiceItem, Consignment, ConsignmentItem,
+    ConsignmentSale, ConsignmentSaleItem, B2BRefund, B2BRefundItem, B2BClientPrice,
+)
 from app.models.product import Product
 from app.models.inventory import StockMove
 from app.models.accounting import Journal, JournalEntry
@@ -1985,6 +1988,119 @@ async def _build_client_products_payload(
             "value_net":      round(sum(r["value_net"] for r in rows), 2),
         },
     }
+
+
+async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSession) -> dict:
+    """
+    What the client is still physically holding on consignment — their own
+    stock of our goods, not yet sold and not yet returned.
+
+    Per consignment line the goods still on the shelf are
+    ``qty_sent - qty_sold - qty_returned``. Two separate flows retire that
+    quantity and only one of them writes to ``qty_sold``:
+
+      • Settle (B2B -> Consignments) moves qty_sold / qty_returned directly
+      • Record Consignment Payment (Accounting -> B2B Clients) is bookkeeping
+        only, and leaves the quantities alone — what the client reported sold
+        lives on the ConsignmentSale lines instead
+
+    So both are netted off here, per product, floored at zero. An operator uses
+    one flow or the other; if both were used for the same goods the accounts
+    already double-count them, and this figure follows the records rather than
+    inventing a reconciliation.
+    """
+    cons_result = await db.execute(
+        select(Consignment)
+        .where(Consignment.client_id == client_id)
+        .options(selectinload(Consignment.items).selectinload(ConsignmentItem.product))
+        .order_by(Consignment.created_at)
+    )
+    consignments = cons_result.scalars().all()
+
+    # Quantities the client reported sold on their payments, by product.
+    sold_result = await db.execute(
+        select(ConsignmentSaleItem)
+        .join(ConsignmentSale, ConsignmentSaleItem.sale_id == ConsignmentSale.id)
+        .where(ConsignmentSale.client_id == client_id)
+    )
+    reported_sold: dict[int, float] = {}
+    for line in sold_result.scalars().all():
+        reported_sold[line.product_id] = reported_sold.get(line.product_id, 0.0) + float(line.qty or 0)
+
+    products: dict[int, dict] = {}
+    for cons in consignments:
+        for ci in cons.items:
+            sent     = float(ci.qty_sent or 0)
+            sold     = float(ci.qty_sold or 0)
+            returned = float(ci.qty_returned or 0)
+            price    = float(ci.unit_price or 0)
+            entry = products.get(ci.product_id)
+            if entry is None:
+                entry = products[ci.product_id] = {
+                    "product_id":       ci.product_id,
+                    "name":             getattr(ci.product, "name", None) or f"Product #{ci.product_id}",
+                    "sku":              getattr(ci.product, "sku", None) or "",
+                    "unit":             getattr(ci.product, "unit", None) or "",
+                    "qty_sent":         0.0,
+                    "qty_settled_sold": 0.0,
+                    "qty_returned":     0.0,
+                    "_price_qty":       0.0,
+                    "_price_value":     0.0,
+                    "last_received":    None,
+                }
+            entry["qty_sent"]         += sent
+            entry["qty_settled_sold"] += sold
+            entry["qty_returned"]     += returned
+            # Unit price is the qty-weighted average of what was sent, so a
+            # product sent twice at different prices values sensibly.
+            entry["_price_qty"]   += sent
+            entry["_price_value"] += sent * price
+            when = cons.created_at
+            if when and (entry["last_received"] is None or when > entry["last_received"]):
+                entry["last_received"] = when
+
+    rows = []
+    for entry in products.values():
+        pid = entry["product_id"]
+        qty_reported = round(reported_sold.get(pid, 0.0), 3)
+        on_hand = entry["qty_sent"] - entry["qty_settled_sold"] - entry["qty_returned"] - qty_reported
+        on_hand = max(0.0, round(on_hand, 3))
+        unit_price = round(entry["_price_value"] / entry["_price_qty"], 2) if entry["_price_qty"] else 0.0
+        rows.append({
+            "product_id":       pid,
+            "name":             entry["name"],
+            "sku":              entry["sku"],
+            "unit":             entry["unit"],
+            "qty_sent":         round(entry["qty_sent"], 3),
+            "qty_sold":         round(entry["qty_settled_sold"] + qty_reported, 3),
+            "qty_returned":     round(entry["qty_returned"], 3),
+            "qty_on_hand":      on_hand,
+            "unit_price":       unit_price,
+            "value_on_hand":    round(on_hand * unit_price, 2),
+            "last_received":    entry["last_received"].strftime("%d-%b-%Y") if entry["last_received"] else "—",
+        })
+    rows.sort(key=lambda r: (-r["value_on_hand"], r["name"].lower()))
+
+    in_stock = [r for r in rows if r["qty_on_hand"] > 0]
+    return {
+        "items": rows,
+        "totals": {
+            "product_lines": len(in_stock),
+            "qty_on_hand":   round(sum(r["qty_on_hand"] for r in rows), 3),
+            "value_on_hand": round(sum(r["value_on_hand"] for r in rows), 2),
+            "qty_sent":      round(sum(r["qty_sent"] for r in rows), 3),
+            "qty_sold":      round(sum(r["qty_sold"] for r in rows), 3),
+            "qty_returned":  round(sum(r["qty_returned"] for r in rows), 3),
+        },
+    }
+
+
+@router.get("/api/clients/{client_id}/consignment-stock")
+async def client_consignment_stock_data(
+    client_id: int,
+    db: AsyncSession = Depends(get_async_session),
+):
+    return await _build_client_consignment_stock_payload(client_id, db)
 
 
 @router.get("/api/clients/{client_id}/products")

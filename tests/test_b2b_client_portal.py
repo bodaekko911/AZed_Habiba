@@ -40,6 +40,8 @@ from app.models.b2b import (
     B2BRefundItem,
     Consignment,
     ConsignmentItem,
+    ConsignmentSale,
+    ConsignmentSaleItem,
 )
 from app.models.product import Product
 from app.models.user import User
@@ -92,6 +94,8 @@ TABLES = [
     B2BInvoiceItem.__table__,
     Consignment.__table__,
     ConsignmentItem.__table__,
+    ConsignmentSale.__table__,
+    ConsignmentSaleItem.__table__,
     B2BRefund.__table__,
     B2BRefundItem.__table__,
 ]
@@ -192,6 +196,25 @@ def build_products(session, client_id=1):
     return run(b2b._build_client_products_payload(client_id, AsyncSessionAdapter(session)))
 
 
+def build_stock(session, client_id=1):
+    return run(b2b._build_client_consignment_stock_payload(client_id, AsyncSessionAdapter(session)))
+
+
+def add_reported_sale(session, *, product_id, qty, unit_price, client_id=1):
+    """A consignment payment recorded through Accounting: the client reported
+    these goods sold, but the flow deliberately leaves qty_sold alone."""
+    sale = ConsignmentSale(client_id=client_id, month_label="August 2026",
+                           subtotal=Decimal(str(qty * unit_price)),
+                           discount=Decimal("0"),
+                           amount=Decimal(str(qty * unit_price)))
+    session.add(sale)
+    session.flush()
+    session.add(ConsignmentSaleItem(sale_id=sale.id, product_id=product_id,
+                                    qty=Decimal(str(qty)), unit_price=Decimal(str(unit_price)),
+                                    total=Decimal(str(qty * unit_price))))
+    session.commit()
+
+
 # ── Netting rules ────────────────────────────────────────────────────────────
 
 def test_consignment_invoice_lines_are_not_counted_twice():
@@ -262,6 +285,66 @@ def test_other_clients_data_never_appears():
     assert tomato["qty_received"] == 40.0        # not 90
 
 
+# ── Stock still held by the client ───────────────────────────────────────────
+
+def test_stock_on_hand_is_what_was_sent_less_sold_and_returned():
+    with make_session() as session:
+        seed(session)
+        data = build_stock(session)
+
+    herb = next(r for r in data["items"] if r["name"] == "Herb bunch")
+    # 20 sent on the standalone consignment, nothing sold or returned
+    assert herb["qty_on_hand"] == 20.0
+    assert herb["unit_price"] == 5.0
+    assert herb["value_on_hand"] == 100.0
+
+    tomato = next(r for r in data["items"] if r["name"] == "Tomato")
+    # 10 sent, 6 settled as sold, 4 returned — nothing left with the client
+    assert tomato["qty_on_hand"] == 0.0
+    assert tomato["value_on_hand"] == 0.0
+
+    # Goods bought outright are not consignment stock and never appear here
+    assert data["totals"]["qty_on_hand"] == 20.0
+    assert data["totals"]["value_on_hand"] == 100.0
+    assert data["totals"]["product_lines"] == 1      # counts only what is in stock
+
+
+def test_reported_sales_reduce_stock_even_though_settle_never_ran():
+    # The Accounting payment flow is bookkeeping only — it does not touch
+    # qty_sold — so the reported sold quantities have to be netted off here.
+    with make_session() as session:
+        seed(session)
+        add_reported_sale(session, product_id=2, qty=8, unit_price=5)
+        data = build_stock(session)
+
+    herb = next(r for r in data["items"] if r["name"] == "Herb bunch")
+    assert herb["qty_sold"] == 8.0
+    assert herb["qty_on_hand"] == 12.0
+    assert herb["value_on_hand"] == 60.0
+
+
+def test_stock_never_goes_negative():
+    with make_session() as session:
+        seed(session)
+        add_reported_sale(session, product_id=2, qty=50, unit_price=5)
+        data = build_stock(session)
+
+    herb = next(r for r in data["items"] if r["name"] == "Herb bunch")
+    assert herb["qty_on_hand"] == 0.0
+
+
+def test_another_clients_consignment_is_not_our_stock():
+    with make_session() as session:
+        seed(session)
+        add_reported_sale(session, product_id=2, qty=5, unit_price=5, client_id=2)
+        data = build_stock(session)
+
+    # Client 2's reported sale must not eat into client 1's stock
+    herb = next(r for r in data["items"] if r["name"] == "Herb bunch")
+    assert herb["qty_on_hand"] == 20.0
+    assert build_stock(session, client_id=2)["items"] == []
+
+
 # ── Portal access control ────────────────────────────────────────────────────
 
 def make_client(session):
@@ -323,6 +406,11 @@ def test_portal_data_returns_statement_and_products():
     assert body["balance_due"] == 600.0              # 1000 charged − 300 paid − 100 refund
     assert body["product_totals"]["value_net"] == 920.0
     assert {p["name"] for p in body["products"]} == {"Tomato", "Herb bunch"}
+    # Stock on hand shows only what the client still holds — the fully
+    # settled tomato consignment is dropped, the untouched herbs remain
+    assert [r["name"] for r in body["stock"]] == ["Herb bunch"]
+    assert body["stock"][0]["qty_on_hand"] == 20.0
+    assert body["stock_totals"]["value_on_hand"] == 100.0
     # Nothing that could identify another client
     assert "Rival Bakery" not in res.text
 

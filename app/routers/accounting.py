@@ -1049,9 +1049,32 @@ async def get_client_consignment_items(client_id: int, db: AsyncSession = Depend
         row["qty_remaining"] += max(0.0, remaining)
 
     out = sorted(grouped.values(), key=lambda r: r["name"].lower())
+
+    # Quantities already reported sold on earlier payments. That flow is
+    # bookkeeping only — it never touches qty_sold — so without this the
+    # picker would keep offering goods the client has already paid for, and
+    # would disagree with the stock figure the client sees on their portal.
+    sold_result = await db.execute(
+        select(ConsignmentSaleItem)
+        .join(ConsignmentSale, ConsignmentSaleItem.sale_id == ConsignmentSale.id)
+        .where(ConsignmentSale.client_id == client_id)
+    )
+    reported_sold: dict[int, float] = {}
+    for line in sold_result.scalars().all():
+        reported_sold[line.product_id] = reported_sold.get(line.product_id, 0.0) + float(line.qty or 0)
+    # Reported sales name a product, not a price band, so drain that product's
+    # rows in order until the reported quantity is used up.
+    for r in out:
+        outstanding = reported_sold.get(r["product_id"], 0.0)
+        if outstanding <= 0:
+            continue
+        taken = min(r["qty_remaining"], outstanding)
+        r["qty_remaining"] -= taken
+        reported_sold[r["product_id"]] = outstanding - taken
+
     for r in out:
         r["qty_sent"] = round(r["qty_sent"], 3)
-        r["qty_remaining"] = round(r["qty_remaining"], 3)
+        r["qty_remaining"] = round(max(0.0, r["qty_remaining"]), 3)
     return {"discount_pct": discount_pct, "items": out}
 
 
