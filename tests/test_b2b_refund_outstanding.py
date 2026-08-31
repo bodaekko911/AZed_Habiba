@@ -161,6 +161,63 @@ def test_outstanding_never_goes_negative():
         assert listed_outstanding(session) == 0.0
 
 
+def settle(session, invoice_id=1):
+    inv = session.get(B2BInvoice, invoice_id)
+    inv.amount_paid = inv.total
+    inv.status = "paid"
+    session.commit()
+
+
+def later_invoice(session, when, total=500):
+    session.add(B2BInvoice(id=2, invoice_number="B2B-00002", client_id=1,
+                           invoice_type="credit", status="unpaid",
+                           subtotal=Decimal(str(total)), total=Decimal(str(total)),
+                           amount_paid=Decimal("0"), created_at=when))
+    session.flush()
+    session.add(B2BInvoiceItem(invoice_id=2, product_id=1, qty=Decimal("25"),
+                               unit_price=Decimal("20"), total=Decimal(str(total))))
+    session.commit()
+
+
+def test_a_refund_from_closed_history_no_longer_discounts_todays_balance():
+    """A credit is spent once, against whatever was open when it was raised.
+
+    Nothing links a refund row to an invoice, so subtracting every refund ever
+    meant a months-old credit kept discounting the balance long after the
+    invoices it belonged to were settled - the client permanently appeared to
+    owe less than the sum of their open invoices.
+    """
+    with make_session() as session:
+        seed(session)
+        b2b_refund(session, qty=10, price=20)      # 200 credit, Aug
+        settle(session)                            # its invoice is paid off
+        later_invoice(session, datetime(2026, 10, 1, tzinfo=timezone.utc), total=500)
+
+        # The October invoice is the only thing open; the August credit belongs
+        # to history and must not come off it.
+        assert listed_outstanding(session) == 500.0
+
+
+def test_a_refund_against_a_still_open_invoice_does_credit_the_balance():
+    with make_session() as session:
+        seed(session)
+        later_invoice(session, datetime(2026, 8, 1, tzinfo=timezone.utc), total=500)
+        # The August invoice from seed() is still open, and the refund is
+        # raised after it, so the credit is live.
+        b2b_refund(session, qty=10, price=20)      # 200
+
+        assert listed_outstanding(session) == 1300.0   # 1000 + 500 - 200
+
+
+def test_a_fully_settled_account_owes_nothing_even_with_old_credits():
+    with make_session() as session:
+        seed(session)
+        b2b_refund(session, qty=10, price=20)
+        settle(session)
+
+        assert listed_outstanding(session) == 0.0
+
+
 def test_refund_guard_uses_the_live_balance_not_the_stored_field():
     """The stored client.outstanding drifts. A refund must be judged against
     the same balance the screen shows."""

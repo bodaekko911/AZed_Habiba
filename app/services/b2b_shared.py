@@ -113,13 +113,44 @@ async def get_b2b_client_top_products(db: AsyncSession) -> dict:
 # B2BClient.outstanding field, which drifts because not every path maintains
 # it. Refunds are credits against the account and must come off the balance.
 #
-#   outstanding = unpaid/partial invoice balances − refunds issued   (min 0)
+#   outstanding = unpaid/partial invoice balances
+#                 − refunds raised since the oldest still-open invoice   (min 0)
+#
+# That last qualifier matters. A refund credits the account once, against
+# whatever was open when it was raised. Nothing links a refund row to an
+# invoice, so subtracting every refund ever meant a credit from months back
+# kept discounting today's balance long after the invoices it belonged to had
+# been settled — the client appeared to owe less than the sum of their open
+# invoices, forever. A refund raised before every currently-open invoice was
+# issued belongs to closed history: its credit was consumed when those
+# invoices were settled, so it no longer moves the current balance. It still
+# appears on the statement, where the history belongs.
 
 # Every status that is not fully settled. "consignment" belongs here: those
 # invoices track AR like any other, their amount_paid is maintained as the
 # client reports sales, and their unpaid balance is money owed — leaving them
 # out under-reported what consignment clients owe on every screen.
 UNPAID_INVOICE_STATUSES = ("unpaid", "partial", "consignment")
+
+
+def open_invoice_since_subquery():
+    """Per-client date of the oldest invoice that still owes something.
+
+    Refunds older than this belong to invoices that have since been settled,
+    so they no longer count against the current balance.
+    """
+    return (
+        select(
+            B2BInvoice.client_id.label("client_id"),
+            sa_func.min(B2BInvoice.created_at).label("since"),
+        )
+        .where(
+            B2BInvoice.status.in_(UNPAID_INVOICE_STATUSES),
+            B2BInvoice.total > B2BInvoice.amount_paid,
+        )
+        .group_by(B2BInvoice.client_id)
+        .subquery()
+    )
 
 
 def client_invoice_balance_subquery():
@@ -138,14 +169,19 @@ def client_invoice_balance_subquery():
 
 
 def client_refund_subquery():
-    """Per-client total of refunds issued."""
+    """Per-client total of refunds that still credit the current balance."""
     from app.models.b2b import B2BRefund
 
+    since = open_invoice_since_subquery()
     return (
         select(
             B2BRefund.client_id,
             sa_func.coalesce(sa_func.sum(B2BRefund.total), 0).label("refunded"),
         )
+        # An inner join drops clients with nothing open — their balance is
+        # zero regardless, so a stale credit cannot push it negative.
+        .join(since, since.c.client_id == B2BRefund.client_id)
+        .where(B2BRefund.created_at >= since.c.since)
         .group_by(B2BRefund.client_id)
         .subquery()
     )
@@ -162,9 +198,23 @@ async def client_outstanding_value(db: AsyncSession, client_id: int) -> float:
             B2BInvoice.status.in_(UNPAID_INVOICE_STATUSES),
         )
     )
+    since = await db.execute(
+        select(sa_func.min(B2BInvoice.created_at))
+        .where(
+            B2BInvoice.client_id == client_id,
+            B2BInvoice.status.in_(UNPAID_INVOICE_STATUSES),
+            B2BInvoice.total > B2BInvoice.amount_paid,
+        )
+    )
+    open_since = since.scalar()
+    if open_since is None:
+        return 0.0
     refunded = await db.execute(
         select(sa_func.coalesce(sa_func.sum(B2BRefund.total), 0))
-        .where(B2BRefund.client_id == client_id)
+        .where(
+            B2BRefund.client_id == client_id,
+            B2BRefund.created_at >= open_since,
+        )
     )
     return max(float(invoiced.scalar() or 0) - float(refunded.scalar() or 0), 0.0)
 
@@ -184,10 +234,8 @@ async def client_outstanding_map(db: AsyncSession) -> dict[int, float]:
     )
     balances: dict[int, float] = {cid: float(amt or 0) for cid, amt in invoiced.all()}
 
-    refunded = await db.execute(
-        select(B2BRefund.client_id, sa_func.coalesce(sa_func.sum(B2BRefund.total), 0))
-        .group_by(B2BRefund.client_id)
-    )
+    since = client_refund_subquery()
+    refunded = await db.execute(select(since.c.client_id, since.c.refunded))
     for cid, amt in refunded.all():
         balances[cid] = balances.get(cid, 0.0) - float(amt or 0)
 

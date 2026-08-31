@@ -506,6 +506,113 @@ def test_shelf_value_reconciles_to_what_the_client_still_owes():
     assert abs(stock["totals"]["net_value_on_hand"] - owed) < 0.01
 
 
+def seed_two_consignment_invoices(session):
+    """The Yostudio shape: an older delivery settled in full, then a newer one
+    part paid, with a single itemised payment spanning both."""
+    client = B2BClient(id=1, name="Yostudio", payment_terms="consignment",
+                       discount_pct=Decimal("20"), is_active=True,
+                       portal_token=TOKEN, portal_enabled=True)
+    balls = Product(id=1, sku="DB", name="Date Balls", price=Decimal("40"), unit="pcs")
+    mint = Product(id=2, sku="WM", name="Wild Mint", price=Decimal("75"), unit="pcs")
+    session.add_all([client, balls, mint])
+    session.flush()
+
+    def delivery(inv_id, cons_id, number, ref, when, lines, paid):
+        gross = sum(q * p for _pid, q, p in lines)
+        net = gross * 0.8
+        session.add(B2BInvoice(
+            id=inv_id, invoice_number=number, client_id=1,
+            invoice_type="consignment",
+            status="paid" if paid >= net - 0.005 else "partial",
+            subtotal=Decimal(str(gross)), discount=Decimal(str(gross - net)),
+            total=Decimal(str(net)), amount_paid=Decimal(str(paid)), created_at=when))
+        session.flush()
+        session.add(Consignment(id=cons_id, ref_number=ref, client_id=1,
+                                invoice_id=inv_id, status="active", created_at=when))
+        session.flush()
+        for pid, qty, price in lines:
+            session.add(B2BInvoiceItem(invoice_id=inv_id, product_id=pid,
+                                       qty=Decimal(str(qty)), unit_price=Decimal(str(price)),
+                                       total=Decimal(str(qty * price))))
+            # The mirror drifts to zero, as it does in production.
+            session.add(ConsignmentItem(consignment_id=cons_id, product_id=pid,
+                                        qty_sent=Decimal("0"), qty_sold=Decimal("0"),
+                                        qty_returned=Decimal("0"),
+                                        unit_price=Decimal(str(price))))
+
+    # 21-Aug: 10 Date Balls, paid in full (400 gross -> 320 net)
+    delivery(1, 1, "B2B-00324", "CONS-0048",
+             datetime(2026, 8, 21, tzinfo=timezone.utc), [(1, 10, 40.0)], 320.0)
+    # 31-Aug: 10 more Date Balls + 3 Wild Mint (625 gross -> 500 net), 180 paid
+    delivery(2, 2, "B2B-00326", "CONS-0050",
+             datetime(2026, 8, 31, tzinfo=timezone.utc),
+             [(1, 10, 40.0), (2, 3, 75.0)], 180.0)
+    session.commit()
+    return client
+
+
+def test_payment_settles_the_invoice_it_was_for_not_the_newest_goods():
+    # One payment of 500 net: 320 cleared B2B-00324 (its 10 Date Balls) and
+    # 180 went to B2B-00326 (its 3 Wild Mint, 225 gross x 0.8). The 10 Date
+    # Balls delivered on the newer invoice are still on the shelf - they must
+    # not be retired by money that belonged to the older one.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        add_reported_sale(session, product_id=1, qty=10, unit_price=40)   # 400 -> inv 324
+        add_reported_sale(session, product_id=2, qty=3, unit_price=75)    # 225 -> inv 326
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    mint = next(r for r in stock["items"] if r["name"] == "Wild Mint")
+    assert balls["qty_sent"] == 20.0
+    assert balls["qty_sold"] == 10.0
+    assert balls["qty_on_hand"] == 10.0
+    assert mint["qty_on_hand"] == 0.0
+    # What is left is exactly the unpaid part of the newer invoice
+    assert stock["totals"]["net_value_on_hand"] == 320.0     # 400 gross x 0.8
+
+
+def test_a_settled_older_invoice_does_not_swallow_the_named_items():
+    # Named items are the newest money. Matching them against the oldest
+    # fully-paid invoice first would consume them there and leave the goods
+    # they were actually reported against sitting on the shelf.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        add_reported_sale(session, product_id=2, qty=3, unit_price=75)
+        stock = build_stock(session)
+
+    mint = next(r for r in stock["items"] if r["name"] == "Wild Mint")
+    assert mint["qty_sold"] == 3.0
+    assert mint["qty_on_hand"] == 0.0
+
+
+def test_a_return_is_not_also_counted_as_sold():
+    # The refunded goods came off the older invoice, which was paid in full.
+    # Counting them as sold there AND as returned would retire them twice and
+    # eat into the newer delivery.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        refund = B2BRefund(id=1, refund_number="BRF-0001", client_id=1,
+                           subtotal=Decimal("80"), total=Decimal("80"),
+                           created_at=datetime(2026, 8, 25, tzinfo=timezone.utc))
+        session.add(refund)
+        session.flush()
+        session.add(B2BRefundItem(refund_id=1, product_id=1, qty=Decimal("2"),
+                                  unit_price=Decimal("40"), total=Decimal("80")))
+        session.commit()
+        add_reported_sale(session, product_id=1, qty=10, unit_price=40)
+        add_reported_sale(session, product_id=2, qty=3, unit_price=75)
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    # 20 sent, 10 reported sold, 2 handed back -> 8 left, not 6: the two that
+    # came back must not also be retired as sold by the invoice that paid.
+    assert balls["qty_sent"] == 20.0
+    assert balls["qty_returned"] == 2.0
+    assert balls["qty_sold"] == 10.0
+    assert balls["qty_on_hand"] == 8.0
+
+
 def test_a_client_with_no_consignments_has_no_stock():
     with make_session() as session:
         seed(session)

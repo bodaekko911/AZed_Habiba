@@ -2006,26 +2006,28 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
 
     What takes it off the shelf
     ---------------------------
-    Three records retire stock, and they do not overlap:
+    On a consignment deal the client pays for what they sell, so **money
+    against an invoice is the record of a sale of that invoice's goods**. Each
+    invoice is settled against its own lines, oldest first - the order
+    ``_record_consignment_client_payment`` allocates payments in - which is
+    what stops a large historical payment bleeding into goods delivered later.
+    Within one invoice:
 
-      1. ``qty_sold`` / ``qty_returned`` on the mirror - written by Settle,
-         which never touches ``amount_paid``
-      2. client refunds - goods physically handed back
-      3. **payment** - on a consignment deal the client pays for what they
-         sell, so money against the invoice IS the record of a sale
+      * goods returned on a client refund come off first: they went back, so
+        they were never sold
+      * items the client actually named on a payment (ConsignmentSale) are
+        taken next, because that is the precise record
+      * whatever the payment covered beyond those is spread across the rest of
+        that invoice by value - a legacy or written-off payment says how much,
+        never which
 
-    (3) is what makes this honest for real accounts. A payment recorded with
-    its sold items (ConsignmentSale) says exactly which goods went; a payment
-    recorded before that feature existed, or written off, says only how much.
-    Both are money against the invoice, so both count - but the itemised part
-    is deducted per product and only the remainder is spread proportionally,
-    by value, over what is left. Deducting the itemised lines AND the full
-    paid amount would retire the same goods twice.
+    Settle writes ``qty_sold`` / ``qty_returned`` on the mirror without ever
+    touching ``amount_paid``, so it is netted off separately from the money.
 
-    The consequence is an invariant worth knowing: with no unrecorded sales,
-    the net value left on the shelf equals the client's outstanding balance,
-    because a consignment client is invoiced for everything sent and pays it
-    down as they sell.
+    The invariant this preserves: with no unrecorded sales, what is left on
+    the shelf is exactly the unpaid part of each invoice, because a
+    consignment client is invoiced for everything sent and pays it down as
+    they sell.
     """
     cons_result = await db.execute(
         select(Consignment)
@@ -2037,8 +2039,6 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
     if not consignments:
         return {"items": [], "totals": _empty_consignment_stock_totals()}
 
-    # The invoices behind those consignments: the authoritative record of what
-    # went out, and of how much of it has been paid for.
     invoice_ids = {c.invoice_id for c in consignments if c.invoice_id}
     invoices: dict[int, B2BInvoice] = {}
     if invoice_ids:
@@ -2075,18 +2075,21 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         if when and (entry["last_received"] is None or when > entry["last_received"]):
             entry["last_received"] = when
 
-    gross_invoiced = 0.0     # subtotal, before the client discount
-    net_invoiced = 0.0       # total, after it
-    net_paid = 0.0
+    billed = []              # (invoice, [(product_id, qty, unit_price)]) oldest first
+    gross_invoiced = 0.0
+    net_invoiced = 0.0
     for cons in consignments:
         invoice = invoices.get(cons.invoice_id) if cons.invoice_id else None
         if invoice is not None:
             gross_invoiced += float(invoice.subtotal or 0)
             net_invoiced += float(invoice.total or 0)
-            net_paid += float(invoice.amount_paid or 0)
+            lines = []
             for it in invoice.items:
-                note_sent(bucket(it.product, it.product_id),
-                          float(it.qty or 0), float(it.unit_price or 0), cons.created_at)
+                qty, price = float(it.qty or 0), float(it.unit_price or 0)
+                note_sent(bucket(it.product, it.product_id), qty, price, cons.created_at)
+                if qty > 0:
+                    lines.append((it.product_id, qty, price))
+            billed.append((invoice, lines))
         for ci in cons.items:
             price = float(ci.unit_price or 0)
             entry = bucket(ci.product, ci.product_id)
@@ -2097,19 +2100,15 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
             if not entry["_price_qty"] and price:      # drifted mirror: keep a price
                 entry["_price_qty"], entry["_price_value"] = 1.0, price
 
-    # Payments that named the goods they were for.
+    # Items the client named on their payments - the precise record.
     sold_result = await db.execute(
         select(ConsignmentSaleItem)
         .join(ConsignmentSale, ConsignmentSaleItem.sale_id == ConsignmentSale.id)
         .where(ConsignmentSale.client_id == client_id)
     )
-    reported_sold: dict[int, float] = {}
+    named_pool: dict[int, float] = {}
     for line in sold_result.scalars().all():
-        reported_sold[line.product_id] = reported_sold.get(line.product_id, 0.0) + float(line.qty or 0)
-    itemised_paid = float((await db.execute(
-        select(func.coalesce(func.sum(ConsignmentSale.amount), 0))
-        .where(ConsignmentSale.client_id == client_id)
-    )).scalar() or 0)
+        named_pool[line.product_id] = named_pool.get(line.product_id, 0.0) + float(line.qty or 0)
 
     # Goods physically handed back. Only products actually placed on
     # consignment count, so a refund against an outright sale cannot eat into
@@ -2119,46 +2118,115 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         .join(B2BRefund, B2BRefundItem.refund_id == B2BRefund.id)
         .where(B2BRefund.client_id == client_id)
     )
-    refunded: dict[int, float] = {}
+    refund_pool: dict[int, float] = {}
     for line in refund_result.scalars().all():
         if line.product_id in products:
-            refunded[line.product_id] = refunded.get(line.product_id, 0.0) + float(line.qty or 0)
+            refund_pool[line.product_id] = refund_pool.get(line.product_id, 0.0) + float(line.qty or 0)
 
-    # Everything the records name explicitly comes off first.
-    for entry in products.values():
-        pid = entry["product_id"]
-        entry["_named_sold"] = round(reported_sold.get(pid, 0.0), 3)
-        entry["_refunded"] = round(refunded.get(pid, 0.0), 3)
-        entry["_unit_price"] = (round(entry["_price_value"] / entry["_price_qty"], 2)
-                                if entry["_price_qty"] else 0.0)
-        entry["_remaining"] = max(0.0, round(
-            entry["qty_sent"] - entry["qty_settled"] - entry["qty_returned"]
-            - entry["_named_sold"] - entry["_refunded"], 3))
+    # Which invoices the itemised payments settled. Payments land on the
+    # oldest open invoice first, and naming the sold items is recent, so the
+    # named money is the newest money: walk back from the latest invoice until
+    # the itemised total is used up. Without this the oldest fully-paid
+    # invoice swallows the named items and they never reach the goods they
+    # were reported against.
+    itemised_paid = float((await db.execute(
+        select(func.coalesce(func.sum(ConsignmentSale.amount), 0))
+        .where(ConsignmentSale.client_id == client_id)
+    )).scalar() or 0)
+    named_invoice_ids: set[int] = set()
+    for invoice, _lines in reversed(billed):
+        if itemised_paid <= 0.005:
+            break
+        paid = float(invoice.amount_paid or 0)
+        if paid <= 0.005:
+            continue
+        named_invoice_ids.add(invoice.id)
+        itemised_paid -= paid
 
-    # Then the money that was paid without naming anything is spread over what
-    # is left, by value. Line prices are gross while payments are net of the
-    # client discount, so the shelf is valued through the same ratio the
-    # invoices themselves used rather than a discount read off the client -
-    # that way a rate that changed over time still reconciles.
-    net_factor = (net_invoiced / gross_invoiced) if gross_invoiced > 0 else 1.0
-    shelf_net_value = sum(e["_remaining"] * e["_unit_price"] for e in products.values()) * net_factor
-    unnamed_paid = max(0.0, round(net_paid - itemised_paid, 2))
-    sold_ratio = min(1.0, unnamed_paid / shelf_net_value) if shelf_net_value > 0.005 else 0.0
+    # ── settle each invoice against its own goods, oldest first ────────────
+    sold_by_payment: dict[int, float] = {}
+    returned_by_refund: dict[int, float] = {}
+
+    def retire(product_id, qty):
+        if qty > 0:
+            sold_by_payment[product_id] = sold_by_payment.get(product_id, 0.0) + qty
+
+    for invoice, raw_lines in billed:
+        # Returned goods came off the earliest delivery that still held them.
+        # Taking them out of the line here, rather than subtracting at the
+        # end, is what stops a return counting both as sold (its invoice was
+        # paid) and as returned.
+        lines = []
+        for pid, qty, price in raw_lines:
+            back = min(qty, refund_pool.get(pid, 0.0))
+            if back > 0:
+                refund_pool[pid] -= back
+                returned_by_refund[pid] = returned_by_refund.get(pid, 0.0) + back
+                qty -= back
+            if qty > 0:
+                lines.append((pid, qty, price))
+
+        total = float(invoice.total or 0)
+        subtotal = float(invoice.subtotal or 0) or total
+        paid = float(invoice.amount_paid or 0)
+        if paid <= 0.005 or not lines:
+            continue
+        fraction = 1.0 if total <= 0.005 else min(1.0, paid / total)
+        use_named = invoice.id in named_invoice_ids
+
+        if fraction >= 0.9999:
+            for pid, qty, _price in lines:
+                retire(pid, qty)
+                if use_named and named_pool.get(pid):
+                    named_pool[pid] = max(0.0, named_pool[pid] - qty)
+            continue
+
+        budget = subtotal * fraction          # gross value this payment covers
+        taken: dict[int, float] = {}
+        if use_named:
+            for pid, qty, price in lines:
+                available = min(qty, named_pool.get(pid, 0.0))
+                if available <= 0:
+                    continue
+                if price > 0:
+                    available = min(available, budget / price)
+                if available <= 0:
+                    break
+                taken[pid] = taken.get(pid, 0.0) + available
+                named_pool[pid] = max(0.0, named_pool.get(pid, 0.0) - available)
+                budget -= available * price
+                retire(pid, available)
+                if budget <= 0.005:
+                    break
+        rest = [(pid, qty - taken.get(pid, 0.0), price) for pid, qty, price in lines]
+        rest_value = sum(q * pr for _pid, q, pr in rest if q > 0)
+        if budget > 0.005 and rest_value > 0.005:
+            ratio = min(1.0, budget / rest_value)
+            for pid, qty, _price in rest:
+                if qty > 0:
+                    retire(pid, qty * ratio)
 
     rows = []
     for entry in products.values():
-        remaining = entry["_remaining"]
-        on_hand = round(remaining * (1 - sold_ratio), 3)
-        unit_price = entry["_unit_price"]
+        pid = entry["product_id"]
+        # Named items no invoice payment accounted for are still reported
+        # sales; refunds no invoice line still held still left the shelf.
+        leftover_named = round(named_pool.get(pid, 0.0), 3)
+        returned = round(returned_by_refund.get(pid, 0.0) + refund_pool.get(pid, 0.0), 3)
+        on_hand = max(0.0, round(
+            entry["qty_sent"] - entry["qty_settled"] - entry["qty_returned"]
+            - returned - sold_by_payment.get(pid, 0.0) - leftover_named, 3))
+        unit_price = (round(entry["_price_value"] / entry["_price_qty"], 2)
+                      if entry["_price_qty"] else 0.0)
         rows.append({
-            "product_id":    entry["product_id"],
+            "product_id":    pid,
             "name":          entry["name"],
             "sku":           entry["sku"],
             "unit":          entry["unit"],
             "qty_sent":      round(entry["qty_sent"], 3),
-            "qty_sold":      round(entry["qty_settled"] + entry["_named_sold"]
-                                  + (remaining - on_hand), 3),
-            "qty_returned":  round(entry["qty_returned"] + entry["_refunded"], 3),
+            "qty_sold":      round(entry["qty_settled"] + sold_by_payment.get(pid, 0.0)
+                                  + leftover_named, 3),
+            "qty_returned":  round(entry["qty_returned"] + returned, 3),
             "qty_on_hand":   on_hand,
             "unit_price":    unit_price,
             "value_on_hand": round(on_hand * unit_price, 2),
@@ -2166,6 +2234,10 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         })
     rows.sort(key=lambda r: (-r["value_on_hand"], r["name"].lower()))
 
+    # Line prices are gross while invoices are billed net of the client
+    # discount, so value the shelf through the ratio the invoices themselves
+    # used - a rate that changed over time still reconciles.
+    net_factor = (net_invoiced / gross_invoiced) if gross_invoiced > 0 else 1.0
     in_stock = [r for r in rows if r["qty_on_hand"] > 0.0005]
     return {
         "items": rows,
