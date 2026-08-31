@@ -42,6 +42,8 @@ from app.models.b2b import (
     ConsignmentItem,
     ConsignmentSale,
     ConsignmentSaleItem,
+    ConsignmentStockCount,
+    ConsignmentStockCountItem,
 )
 from app.models.product import Product
 from app.models.user import User
@@ -96,6 +98,8 @@ TABLES = [
     ConsignmentItem.__table__,
     ConsignmentSale.__table__,
     ConsignmentSaleItem.__table__,
+    ConsignmentStockCount.__table__,
+    ConsignmentStockCountItem.__table__,
     B2BRefund.__table__,
     B2BRefundItem.__table__,
 ]
@@ -200,13 +204,14 @@ def build_stock(session, client_id=1):
     return run(b2b._build_client_consignment_stock_payload(client_id, AsyncSessionAdapter(session)))
 
 
-def add_reported_sale(session, *, product_id, qty, unit_price, client_id=1):
+def add_reported_sale(session, *, product_id, qty, unit_price, client_id=1, when=None):
     """A consignment payment recorded through Accounting: the client reported
     these goods sold, but the flow deliberately leaves qty_sold alone."""
     sale = ConsignmentSale(client_id=client_id, month_label="August 2026",
                            subtotal=Decimal(str(qty * unit_price)),
                            discount=Decimal("0"),
-                           amount=Decimal(str(qty * unit_price)))
+                           amount=Decimal(str(qty * unit_price)),
+                           created_at=when or datetime(2026, 8, 31, tzinfo=timezone.utc))
     session.add(sale)
     session.flush()
     session.add(ConsignmentSaleItem(sale_id=sale.id, product_id=product_id,
@@ -611,6 +616,114 @@ def test_a_return_is_not_also_counted_as_sold():
     assert balls["qty_returned"] == 2.0
     assert balls["qty_sold"] == 10.0
     assert balls["qty_on_hand"] == 8.0
+
+
+def count_stock(session, when, lines, client_id=1):
+    """Record a physical count: {product_id: qty}."""
+    c = ConsignmentStockCount(client_id=client_id, counted_at=when)
+    session.add(c)
+    session.flush()
+    for pid, qty in lines.items():
+        session.add(ConsignmentStockCountItem(count_id=c.id, product_id=pid,
+                                              qty=Decimal(str(qty))))
+    session.commit()
+    return c
+
+
+def test_a_count_overrides_what_the_invoices_imply():
+    # The derived figure cannot know about a sale nobody recorded, nor about
+    # goods that were paid for but never left the shelf. A count can say both.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        # Derivation would leave 10 Date Balls; the shelf actually has 4, and
+        # 3 Wild Mint the payment implied were gone are still there.
+        count_stock(session, datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    {1: 4, 2: 3})
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    mint = next(r for r in stock["items"] if r["name"] == "Wild Mint")
+    assert balls["qty_on_hand"] == 4.0
+    assert mint["qty_on_hand"] == 3.0
+    assert stock["counted_at"] == "01-Sep-2026"
+
+
+def test_deliveries_after_a_count_are_added_to_it():
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        count_stock(session, datetime(2026, 8, 25, tzinfo=timezone.utc), {1: 4})
+        # B2B-00326 (31-Aug) lands after the count: 10 more Date Balls, and
+        # its 3 Wild Mint. Only 180 of its 500 net is paid.
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    assert balls["qty_counted"] == 4.0
+    assert balls["qty_sent"] == 10.0          # only the post-count delivery
+    assert balls["qty_on_hand"] > 4.0         # the count plus what is unpaid
+
+
+def test_a_sale_reported_after_a_count_comes_off_it():
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        count_stock(session, datetime(2026, 9, 1, tzinfo=timezone.utc), {1: 4})
+        add_reported_sale(session, product_id=1, qty=3, unit_price=40,
+                          when=datetime(2026, 9, 5, tzinfo=timezone.utc))
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    assert balls["qty_on_hand"] == 1.0
+
+
+def test_history_before_a_count_is_superseded_not_re_subtracted():
+    # Everything the older invoices and their payments imply is represented by
+    # the count itself, so none of it may be applied on top of it again.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        add_reported_sale(session, product_id=1, qty=10, unit_price=40)
+        count_stock(session, datetime(2026, 9, 1, tzinfo=timezone.utc), {1: 6})
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    assert balls["qty_on_hand"] == 6.0        # not 6 - 10 clamped to 0
+
+
+def test_the_latest_count_is_the_one_that_counts():
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        count_stock(session, datetime(2026, 9, 1, tzinfo=timezone.utc), {1: 4})
+        count_stock(session, datetime(2026, 9, 20, tzinfo=timezone.utc), {1: 7})
+        stock = build_stock(session)
+
+    balls = next(r for r in stock["items"] if r["name"] == "Date Balls")
+    assert balls["qty_on_hand"] == 7.0
+    assert stock["counted_at"] == "20-Sep-2026"
+
+
+def test_a_product_left_off_the_count_is_counted_as_zero():
+    # A count is a statement about the whole shelf, so anything not on it is
+    # not there - otherwise stale stock would linger with no way to clear it.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)
+        count_stock(session, datetime(2026, 9, 1, tzinfo=timezone.utc), {1: 4})
+        stock = build_stock(session)
+
+    mint = next((r for r in stock["items"] if r["name"] == "Wild Mint"), None)
+    assert mint is None or mint["qty_on_hand"] == 0.0
+    assert stock["totals"]["qty_on_hand"] == 4.0
+
+
+def test_a_counted_shelf_is_still_valued_at_the_clients_billed_prices():
+    # With every invoice superseded by the count there is no invoice left to
+    # read the discount rate from, so it has to come from the client instead -
+    # otherwise a counted shelf would be valued gross while every other one is
+    # valued net.
+    with make_session() as session:
+        seed_two_consignment_invoices(session)      # client discount is 20%
+        count_stock(session, datetime(2026, 9, 30, tzinfo=timezone.utc), {1: 5})
+        stock = build_stock(session)
+
+    assert stock["totals"]["value_on_hand"] == 200.0            # 5 x 40 gross
+    assert stock["totals"]["net_value_on_hand"] == 160.0        # x 0.8
 
 
 def test_a_client_with_no_consignments_has_no_stock():

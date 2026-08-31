@@ -12,6 +12,8 @@ from app.models.b2b import (
     Consignment,
     ConsignmentItem,
     ConsignmentSale,
+    ConsignmentStockCount,
+    ConsignmentStockCountItem,
     ConsignmentSaleItem,
 )
 from app.models.customer import Customer
@@ -60,6 +62,8 @@ __all__ = [
     "Consignment",
     "ConsignmentItem",
     "ConsignmentSale",
+    "ConsignmentStockCount",
+    "ConsignmentStockCountItem",
     "ConsignmentSaleItem",
     "CarbonEmissionFactor",
     "CarbonLog",

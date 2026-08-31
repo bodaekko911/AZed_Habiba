@@ -153,6 +153,45 @@ class ConsignmentSaleItem(Base):
     product     = relationship("Product")
 
 
+class ConsignmentStockCount(Base):
+    """
+    A physical count of what a consignment client actually has on the shelf.
+
+    Stock on hand is otherwise *derived* - from what was invoiced out and how
+    much of it has been paid for - so it cannot know about a sale nobody
+    recorded, or goods that were paid for but never left the client's shelf.
+    A count is the operator saying "I looked, this is what is there", and from
+    its date forward it is the baseline: deliveries, reported sales and
+    returns after it are applied on top, everything before it is superseded.
+    """
+    __tablename__ = "consignment_stock_counts"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    client_id   = Column(Integer, ForeignKey("b2b_clients.id"), nullable=False, index=True)
+    user_id     = Column(Integer, ForeignKey("users.id"), nullable=True)
+    counted_at  = Column(DateTime(timezone=True), nullable=False)
+    notes       = Column(Text)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+    client      = relationship("B2BClient")
+    user        = relationship("User")
+    items       = relationship("ConsignmentStockCountItem", back_populates="count",
+                               cascade="all, delete-orphan")
+
+
+class ConsignmentStockCountItem(Base):
+    __tablename__ = "consignment_stock_count_items"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    count_id    = Column(Integer, ForeignKey("consignment_stock_counts.id"),
+                         nullable=False, index=True)
+    product_id  = Column(Integer, ForeignKey("products.id"), nullable=False)
+    qty         = Column(Numeric(12, 3), nullable=False)
+
+    count       = relationship("ConsignmentStockCount", back_populates="items")
+    product     = relationship("Product")
+
+
 class B2BRefund(Base):
     __tablename__ = "b2b_refunds"
 

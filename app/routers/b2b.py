@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy import func, select
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from decimal import Decimal
 from datetime import date, datetime, time, timedelta, timezone
 import re
@@ -17,7 +17,8 @@ from app.core.product_types import is_stock_tracked_product, normalize_item_type
 from app.core.templates import templates
 from app.models.b2b import (
     B2BClient, B2BInvoice, B2BInvoiceItem, Consignment, ConsignmentItem,
-    ConsignmentSale, ConsignmentSaleItem, B2BRefund, B2BRefundItem, B2BClientPrice,
+    ConsignmentSale, ConsignmentSaleItem, ConsignmentStockCount,
+    ConsignmentStockCountItem, B2BRefund, B2BRefundItem, B2BClientPrice,
 )
 from app.models.product import Product
 from app.models.inventory import StockMove
@@ -2029,6 +2030,18 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
     consignment client is invoiced for everything sent and pays it down as
     they sell.
     """
+    # A physical count supersedes everything up to the moment it was taken.
+    count_result = await db.execute(
+        select(ConsignmentStockCount)
+        .where(ConsignmentStockCount.client_id == client_id)
+        .options(selectinload(ConsignmentStockCount.items)
+                 .selectinload(ConsignmentStockCountItem.product))
+        .order_by(ConsignmentStockCount.counted_at.desc(), ConsignmentStockCount.id.desc())
+        .limit(1)
+    )
+    count = count_result.scalars().first()
+    counted_at = count.counted_at if count else None
+
     cons_result = await db.execute(
         select(Consignment)
         .where(Consignment.client_id == client_id)
@@ -2036,8 +2049,12 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         .order_by(Consignment.created_at)
     )
     consignments = cons_result.scalars().all()
-    if not consignments:
+    if not consignments and not count:
         return {"items": [], "totals": _empty_consignment_stock_totals()}
+    if counted_at is not None:
+        # Everything delivered before the count is represented by the count.
+        consignments = [c for c in consignments
+                        if c.created_at and c.created_at > counted_at]
 
     invoice_ids = {c.invoice_id for c in consignments if c.invoice_id}
     invoices: dict[int, B2BInvoice] = {}
@@ -2075,6 +2092,18 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         if when and (entry["last_received"] is None or when > entry["last_received"]):
             entry["last_received"] = when
 
+    counted_qty: dict[int, float] = {}
+    if count:
+        for ci in count.items:
+            qty = float(ci.qty or 0)
+            entry = bucket(ci.product, ci.product_id)
+            counted_qty[ci.product_id] = counted_qty.get(ci.product_id, 0.0) + qty
+            price = float(getattr(ci.product, "price", 0) or 0)
+            if price and not entry["_price_qty"]:
+                entry["_price_qty"], entry["_price_value"] = qty or 1.0, (qty or 1.0) * price
+            if entry["last_received"] is None:
+                entry["last_received"] = counted_at
+
     billed = []              # (invoice, [(product_id, qty, unit_price)]) oldest first
     gross_invoiced = 0.0
     net_invoiced = 0.0
@@ -2101,10 +2130,13 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
                 entry["_price_qty"], entry["_price_value"] = 1.0, price
 
     # Items the client named on their payments - the precise record.
+    sale_scope = [ConsignmentSale.client_id == client_id]
+    if counted_at is not None:
+        sale_scope.append(ConsignmentSale.created_at > counted_at)
     sold_result = await db.execute(
         select(ConsignmentSaleItem)
         .join(ConsignmentSale, ConsignmentSaleItem.sale_id == ConsignmentSale.id)
-        .where(ConsignmentSale.client_id == client_id)
+        .where(*sale_scope)
     )
     named_pool: dict[int, float] = {}
     for line in sold_result.scalars().all():
@@ -2113,10 +2145,13 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
     # Goods physically handed back. Only products actually placed on
     # consignment count, so a refund against an outright sale cannot eat into
     # consignment stock.
+    refund_scope = [B2BRefund.client_id == client_id]
+    if counted_at is not None:
+        refund_scope.append(B2BRefund.created_at > counted_at)
     refund_result = await db.execute(
         select(B2BRefundItem)
         .join(B2BRefund, B2BRefundItem.refund_id == B2BRefund.id)
-        .where(B2BRefund.client_id == client_id)
+        .where(*refund_scope)
     )
     refund_pool: dict[int, float] = {}
     for line in refund_result.scalars().all():
@@ -2131,7 +2166,7 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
     # were reported against.
     itemised_paid = float((await db.execute(
         select(func.coalesce(func.sum(ConsignmentSale.amount), 0))
-        .where(ConsignmentSale.client_id == client_id)
+        .where(*sale_scope)
     )).scalar() or 0)
     named_invoice_ids: set[int] = set()
     for invoice, _lines in reversed(billed):
@@ -2214,7 +2249,8 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
         leftover_named = round(named_pool.get(pid, 0.0), 3)
         returned = round(returned_by_refund.get(pid, 0.0) + refund_pool.get(pid, 0.0), 3)
         on_hand = max(0.0, round(
-            entry["qty_sent"] - entry["qty_settled"] - entry["qty_returned"]
+            counted_qty.get(pid, 0.0)
+            + entry["qty_sent"] - entry["qty_settled"] - entry["qty_returned"]
             - returned - sold_by_payment.get(pid, 0.0) - leftover_named, 3))
         unit_price = (round(entry["_price_value"] / entry["_price_qty"], 2)
                       if entry["_price_qty"] else 0.0)
@@ -2223,6 +2259,7 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
             "name":          entry["name"],
             "sku":           entry["sku"],
             "unit":          entry["unit"],
+            "qty_counted":   round(counted_qty.get(pid, 0.0), 3),
             "qty_sent":      round(entry["qty_sent"], 3),
             "qty_sold":      round(entry["qty_settled"] + sold_by_payment.get(pid, 0.0)
                                   + leftover_named, 3),
@@ -2237,10 +2274,20 @@ async def _build_client_consignment_stock_payload(client_id: int, db: AsyncSessi
     # Line prices are gross while invoices are billed net of the client
     # discount, so value the shelf through the ratio the invoices themselves
     # used - a rate that changed over time still reconciles.
-    net_factor = (net_invoiced / gross_invoiced) if gross_invoiced > 0 else 1.0
+    if gross_invoiced > 0:
+        net_factor = net_invoiced / gross_invoiced
+    else:
+        # A shelf made only of counted goods has no invoice to read the rate
+        # from, so fall back to the client's agreed discount - otherwise a
+        # counted shelf would be valued gross while every other one is net.
+        client_discount = float((await db.execute(
+            select(B2BClient.discount_pct).where(B2BClient.id == client_id)
+        )).scalar() or 0)
+        net_factor = 1.0 - max(0.0, min(100.0, client_discount)) / 100
     in_stock = [r for r in rows if r["qty_on_hand"] > 0.0005]
     return {
         "items": rows,
+        "counted_at": counted_at.strftime("%d-%b-%Y") if counted_at else None,
         "totals": {
             "product_lines": len(in_stock),
             "qty_on_hand":   round(sum(r["qty_on_hand"] for r in rows), 3),
@@ -2259,6 +2306,87 @@ def _empty_consignment_stock_totals() -> dict:
     return {
         "product_lines": 0, "qty_on_hand": 0.0, "value_on_hand": 0.0,
         "qty_sent": 0.0, "qty_sold": 0.0, "qty_returned": 0.0,
+    }
+
+
+class StockCountItemIn(BaseModel):
+    product_id: int
+    qty:        float = Field(..., ge=0)
+
+
+class StockCountCreate(BaseModel):
+    items:      List[StockCountItemIn]
+    counted_at: Optional[datetime] = None
+    notes:      Optional[str] = None
+
+
+@router.post("/api/clients/{client_id}/consignment-stock-count",
+             dependencies=[Depends(require_action("b2b", "invoices", "settle"))])
+async def record_consignment_stock_count(
+    client_id: int,
+    data: StockCountCreate,
+    db: AsyncSession = Depends(get_async_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Record what is physically on the client's shelf right now.
+
+    From this moment the count is the baseline for stock on hand: later
+    deliveries, reported sales and returns are applied on top of it, and the
+    derivation from older invoices is superseded. It is a stock record only -
+    no journal, no change to what the client owes, because counting goods
+    does not settle an invoice.
+    """
+    client = (await db.execute(
+        select(B2BClient).where(B2BClient.id == client_id)
+    )).scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    counted_at = data.counted_at or datetime.now(timezone.utc)
+    if counted_at.tzinfo is None:
+        counted_at = counted_at.replace(tzinfo=timezone.utc)
+    if counted_at > datetime.now(timezone.utc) + timedelta(days=1):
+        raise HTTPException(status_code=400, detail="Count date cannot be in the future")
+
+    lines: dict[int, float] = {}
+    for item in data.items:
+        qty = round(float(item.qty), 3)
+        if qty < 0:
+            raise HTTPException(status_code=400, detail="Counted quantity cannot be negative")
+        lines[int(item.product_id)] = lines.get(int(item.product_id), 0.0) + qty
+    if not lines:
+        raise HTTPException(status_code=400, detail="A count must list at least one product")
+
+    known = (await db.execute(
+        select(Product.id).where(Product.id.in_(lines.keys()))
+    )).scalars().all()
+    missing = set(lines) - set(known)
+    if missing:
+        raise HTTPException(status_code=404,
+                            detail=f"Unknown product(s): {sorted(missing)}")
+
+    count = ConsignmentStockCount(
+        client_id=client.id, user_id=current_user.id,
+        counted_at=counted_at, notes=data.notes,
+    )
+    db.add(count)
+    await db.flush()
+    for product_id, qty in lines.items():
+        db.add(ConsignmentStockCountItem(
+            count_id=count.id, product_id=product_id, qty=Decimal(str(qty)),
+        ))
+
+    record(db, "B2B", "consignment_stock_count",
+           f"Counted consignment stock - {client.name} - "
+           f"{len(lines)} product(s) on {counted_at:%d-%b-%Y}",
+           user=current_user, ref_type="b2b_client", ref_id=client.id)
+    await db.commit()
+    return {
+        "ok": True,
+        "count_id": count.id,
+        "client": client.name,
+        "counted_at": counted_at.strftime("%d-%b-%Y"),
+        "stock": await _build_client_consignment_stock_payload(client.id, db),
     }
 
 

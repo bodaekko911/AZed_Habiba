@@ -116,6 +116,7 @@ async def _portal_payload(db: AsyncSession, client: B2BClient) -> dict:
         # products. Empty for clients who never took anything on consignment.
         "stock":            [r for r in stock["items"] if r["qty_on_hand"] > 0],
         "stock_totals":     stock["totals"],
+        "stock_counted_at": stock.get("counted_at"),
     }
 
 
@@ -439,7 +440,7 @@ function renderStock(d){
     <div class="block">
       <div class="block-title">
         <span>Goods you still hold on consignment</span>
-        <span>Sold and returned already deducted &middot; amounts in EGP</span>
+        <span>${d.stock_counted_at ? "Counted " + esc(d.stock_counted_at) + " &middot; " : ""}amounts in EGP</span>
       </div>
       <div class="scroll"><table>
         <thead><tr><th>Product</th><th class="num">On hand</th><th>Unit</th>

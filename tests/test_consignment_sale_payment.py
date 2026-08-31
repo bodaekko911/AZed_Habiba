@@ -16,6 +16,7 @@ from app.models.accounting import Account, Journal, JournalEntry
 from app.models.b2b import (
     B2BClient, B2BInvoice, B2BInvoiceItem, B2BRefund,
     Consignment, ConsignmentItem, ConsignmentSale, ConsignmentSaleItem,
+    ConsignmentStockCount, ConsignmentStockCountItem,
 )
 from app.models.product import Product
 from app.models.user import User
@@ -70,6 +71,8 @@ def make_session():
             ConsignmentItem.__table__,
             ConsignmentSale.__table__,
             ConsignmentSaleItem.__table__,
+            ConsignmentStockCount.__table__,
+            ConsignmentStockCountItem.__table__,
             Account.__table__,
             Journal.__table__,
             JournalEntry.__table__,

@@ -212,6 +212,27 @@ async def ensure_consignment_sales_tables() -> None:
             total NUMERIC(14, 2) NOT NULL
         )
         """,
+        # Mirrors migration 20260831_0047 - the physical shelf, recorded.
+        """
+        CREATE TABLE IF NOT EXISTS consignment_stock_counts (
+            id SERIAL PRIMARY KEY,
+            client_id INTEGER NOT NULL REFERENCES b2b_clients(id),
+            user_id INTEGER REFERENCES users(id),
+            counted_at TIMESTAMPTZ NOT NULL,
+            notes TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS consignment_stock_count_items (
+            id SERIAL PRIMARY KEY,
+            count_id INTEGER NOT NULL REFERENCES consignment_stock_counts(id),
+            product_id INTEGER NOT NULL REFERENCES products(id),
+            qty NUMERIC(12, 3) NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_consignment_stock_counts_client_id ON consignment_stock_counts (client_id)",
+        "CREATE INDEX IF NOT EXISTS ix_consignment_stock_count_items_count_id ON consignment_stock_count_items (count_id)",
         "CREATE INDEX IF NOT EXISTS ix_consignment_sales_client_id ON consignment_sales (client_id)",
         "CREATE INDEX IF NOT EXISTS ix_consignment_sale_items_sale_id ON consignment_sale_items (sale_id)",
     ]
