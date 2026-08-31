@@ -426,6 +426,86 @@ def test_client_refunds_take_consignment_goods_back_off_the_shelf():
     assert beans["qty_on_hand"] == 3.0
 
 
+def pay(session, amount, *, invoice_id=1, subtotal=None, total=None):
+    """Mark money against the consignment invoice, the way collecting does."""
+    inv = session.get(B2BInvoice, invoice_id)
+    if subtotal is not None:
+        inv.subtotal = Decimal(str(subtotal))
+    if total is not None:
+        inv.total = Decimal(str(total))
+    inv.amount_paid = Decimal(str(amount))
+    inv.status = "paid" if float(inv.amount_paid) >= float(inv.total) else "partial"
+    session.commit()
+
+
+def test_a_fully_paid_consignment_leaves_nothing_on_the_shelf():
+    # The client pays for what they sell. A consignment invoice paid in full
+    # means the goods are gone, even when nobody recorded which ones - the
+    # case for every payment taken before sold-item detail existed.
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        pay(session, 900)
+        stock = build_stock(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    assert beans["qty_sent"] == 5.0
+    assert beans["qty_on_hand"] == 0.0
+    assert stock["totals"]["value_on_hand"] == 0.0
+
+
+def test_a_part_paid_consignment_leaves_the_unpaid_share():
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        pay(session, 360)          # 40% of 900
+        stock = build_stock(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    assert beans["qty_on_hand"] == 3.0        # 5 x (1 - 0.4)
+    assert beans["value_on_hand"] == 540.0
+
+
+def test_the_discount_is_taken_out_before_money_is_matched_to_goods():
+    # Line prices are gross, payments are net. Valuing the shelf through the
+    # invoice's own net ratio is what makes a fully paid discounted invoice
+    # come out at zero instead of leaving a phantom 20% on the shelf.
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        pay(session, 720, subtotal=900, total=720)     # 20% client discount
+        stock = build_stock(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    assert beans["qty_on_hand"] == 0.0
+
+
+def test_an_itemised_payment_is_not_counted_twice():
+    # A payment recorded with its sold items lands in BOTH places: the
+    # ConsignmentSale lines and the invoice's amount_paid. Retiring the named
+    # goods and then spreading the same money again would sell them twice.
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        add_reported_sale(session, product_id=1, qty=2, unit_price=180)   # 360
+        pay(session, 360)
+        stock = build_stock(session)
+
+    beans = next(r for r in stock["items"] if r["name"] == "Coffee beans")
+    assert beans["qty_sold"] == 2.0
+    assert beans["qty_on_hand"] == 3.0        # not 1.8
+
+
+def test_shelf_value_reconciles_to_what_the_client_still_owes():
+    # The invariant the whole model rests on: a consignment client is invoiced
+    # for everything sent and pays it down as they sell, so with no unrecorded
+    # sales the shelf is worth exactly the outstanding balance.
+    with make_session() as session:
+        seed_drifted_consignment(session)
+        pay(session, 360, subtotal=900, total=720)
+        stock = build_stock(session)
+        inv = session.get(B2BInvoice, 1)
+        owed = float(inv.total) - float(inv.amount_paid)
+
+    assert abs(stock["totals"]["net_value_on_hand"] - owed) < 0.01
+
+
 def test_a_client_with_no_consignments_has_no_stock():
     with make_session() as session:
         seed(session)
